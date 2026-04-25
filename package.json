@@ -1,0 +1,21 @@
+{
+  "name": "iot-campus-security-system",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start-dev-stack.ps1",
+    "dev:db": "powershell -ExecutionPolicy Bypass -File .\\scripts\\ensure-mysql.ps1",
+    "dev:backend": "end_part\\mvnw.cmd -f end_part\\pom.xml spring-boot:run",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:stack": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start-dev-stack.ps1",
+    "stop": "powershell -ExecutionPolicy Bypass -File .\\scripts\\stop-dev-stack.ps1",
+    "stop:stack": "powershell -ExecutionPolicy Bypass -File .\\scripts\\stop-dev-stack.ps1",
+    "build:frontend": "npm --prefix frontend run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "dependencies": {
+    "pptxgenjs": "^4.0.1"
+  }
+}

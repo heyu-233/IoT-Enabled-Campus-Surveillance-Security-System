@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="IoT-enabled campus surveillance frontend for live monitoring, alerts, analytics, and system control." />
+    <title>Campus Sentinel</title>
+    <script>
+      (() => {
+        const savedTheme = localStorage.getItem('campus-sentinel-theme') || 'day'
+        const savedLocale = localStorage.getItem('campus-sentinel-locale') || 'en'
+        document.documentElement.dataset.theme = savedTheme
+        document.documentElement.lang = savedLocale
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
