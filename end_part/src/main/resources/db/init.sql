@@ -74,10 +74,6 @@ CREATE TABLE IF NOT EXISTS alert_settings (
 ALTER TABLE cameras ADD COLUMN IF NOT EXISTS device_id VARCHAR(100) NULL UNIQUE AFTER name;
 ALTER TABLE behaviors ADD COLUMN IF NOT EXISTS original_image_url VARCHAR(200) NULL AFTER image_url;
 
-INSERT IGNORE INTO users (username, password, email, role, created_at, updated_at) VALUES
-('admin', '$2a$10$e6Z9yTqf9e3w3e4r5t6y7u8i9o0p1q2r3s4t5u6v7w8x9y0z', 'admin@example.com', 'ADMIN', NOW(), NOW()),
-('user', '$2a$10$e6Z9yTqf9e3w3e4r5t6y7u8i9o0p1q2r3s4t5u6v7w8x9y0z', 'user@example.com', 'USER', NOW(), NOW());
-
 INSERT IGNORE INTO cameras (name, device_id, ip_address, port, location, status, stream_url, last_active, created_at, updated_at) VALUES
 ('Camera 1', 'edge-camera-01', '192.0.2.10', 554, 'Main Entrance', 'ONLINE', 'http://127.0.0.1:8080/live/camera1.flv', NOW(), NOW(), NOW()),
 ('Camera 2', 'edge-camera-02', '192.0.2.11', 554, 'Back Entrance', 'ONLINE', 'http://127.0.0.1:8080/live/camera2.flv', NOW(), NOW(), NOW()),

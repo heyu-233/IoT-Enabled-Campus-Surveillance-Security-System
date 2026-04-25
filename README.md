@@ -1,6 +1,6 @@
 ﻿# IoT-Enabled Campus Surveillance Security System
 
-This repository contains the code used for an embedded campus surveillance demo.
+This repository contains the code for an embedded campus surveillance system.
 It combines camera-side video capture, RTMP streaming, YOLO-based detection, a
 Spring Boot backend, and a Vue frontend.
 
@@ -22,7 +22,7 @@ Spring Boot backend, and a Vue frontend.
 
 This public-safe repository does not include:
 
-- thesis reports, project proposals, presentation slides, or support ZIP files
+- reports, presentations, archives, or other non-code project materials
 - raw datasets, training caches, experiment folders, or large package mirrors
 - personal deployment notes, private IP layouts, local absolute paths, or fixed credentials
 
@@ -62,4 +62,4 @@ variables in the shell scripts or export them from your environment before use.
 ## Notes
 
 - Default configuration now uses local-safe placeholders and environment variables.
-- If you publish this repository, keep your real credentials and deployment files out of Git.
+- Keep real credentials, deployment notes, and private environment files out of Git.

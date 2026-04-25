@@ -11,8 +11,8 @@ export default {
   },
   nav: { overview: 'Overview', monitoring: 'Monitoring', alerts: 'Alerts', behaviors: 'Behaviors', analytics: 'Analytics', system: 'System', logout: 'Logout' },
   auth: {
-    signIn: 'Sign in', username: 'Username', password: 'Password', remember: 'Keep this session ready for demos',
-    helper: 'Use your backend account to access live monitoring and admin tools.',
+    signIn: 'Sign in', username: 'Username', password: 'Password', remember: 'Keep this session active on this device',
+    helper: 'Use your backend account to access live monitoring and management tools.',
     tagline: 'Realtime campus awareness for operators and administrators.',
     email: 'Email',
     confirmPassword: 'Confirm password',
