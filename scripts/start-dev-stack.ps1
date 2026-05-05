@@ -32,6 +32,16 @@ function Write-Step {
   Write-Host "[iot-stack] $Message"
 }
 
+function Get-LocalNginxProcesses {
+  if (-not (Test-Path $nginxExe)) {
+    return @()
+  }
+
+  return @(Get-Process nginx -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path -ieq $nginxExe
+  })
+}
+
 function Test-PortOpen {
   param(
     [string]$TargetHost = '127.0.0.1',
@@ -135,6 +145,32 @@ function Start-ManagedProcess {
   Write-Step "$Name started with PID $($process.Id). Logs: $stdout"
 }
 
+function Stop-LocalNginx {
+  $localNginx = Get-LocalNginxProcesses
+  if ($localNginx.Count -eq 0) {
+    return
+  }
+
+  try {
+    & $nginxExe -p $nginxRoot -c conf/nginx.conf -s quit | Out-Null
+  } catch {
+    Write-Step 'Local Nginx quit signal failed, forcing shutdown of stale processes.'
+  }
+
+  $deadline = (Get-Date).AddSeconds(10)
+  do {
+    Start-Sleep -Milliseconds 500
+    $localNginx = Get-LocalNginxProcesses
+  } while ($localNginx.Count -gt 0 -and (Get-Date) -lt $deadline)
+
+  if ($localNginx.Count -gt 0) {
+    $localNginx | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Step 'Forced shutdown of stale local Nginx processes.'
+  } else {
+    Write-Step 'Stale local Nginx processes stopped.'
+  }
+}
+
 function Get-DetectorPython {
   $candidates = @(
     (Join-Path $root 'end_part\.venv\Scripts\python.exe'),
@@ -148,14 +184,14 @@ function Get-DetectorPython {
     }
 
     try {
-      & $candidate -c "import cv2; import paho.mqtt.client; from ultralytics import YOLO" *> $null
+      & $candidate -c "import cv2; from ultralytics import YOLO" *> $null
       return $candidate
     } catch {
       continue
     }
   }
 
-  throw 'No suitable Python interpreter found for detector supervisor. Need cv2, paho-mqtt, ultralytics.'
+  throw 'No suitable Python interpreter found for detector supervisor. Need cv2, ultralytics.'
 }
 
 function Start-LocalNginx {
@@ -185,8 +221,14 @@ function Start-LocalNginx {
     return
   }
 
+  if ((Get-LocalNginxProcesses).Count -gt 0) {
+    Write-Step 'Found stale local Nginx processes without healthy listeners. Restarting them...'
+    Stop-LocalNginx
+  }
+
   Write-Step 'Starting local Nginx for RTMP/HTTP-FLV...'
-  & $nginxExe -p $nginxRoot -c conf/nginx.conf
+  $startArgs = "cd /d `"$nginxRoot`" && start `"`" /b nginx.exe -p `"$nginxRoot`" -c conf/nginx.conf"
+  cmd /c $startArgs | Out-Null
 }
 
 Write-Step 'Ensuring MySQL is running...'

@@ -1,7 +1,7 @@
 #!/bin/sh
 
-ETH_DEV="${ETH_DEV:-eth0}"
-ETH_IP="${ETH_IP:-192.0.2.2/24}"
+ETH_DEV="eth0"
+ETH_IP="192.168.1.2/24"
 
 echo "[net_up] configuring ${ETH_DEV} -> ${ETH_IP}"
 

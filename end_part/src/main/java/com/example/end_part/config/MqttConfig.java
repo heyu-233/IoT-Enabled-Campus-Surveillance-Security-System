@@ -39,6 +39,9 @@ public class MqttConfig {
     @Value("${mqtt.topic.edge:edge/#}")
     private String edgeTopic;
 
+    @Value("${mqtt.topic.sensors:sensors/+}")
+    private String sensorsTopic;
+
     @Autowired
     private MqttMessageService mqttMessageService;
 
@@ -77,7 +80,8 @@ public class MqttConfig {
         try {
             client.connect(options);
             client.subscribe(edgeTopic, qos);
-            logger.info("MQTT connected and subscribed to {}", edgeTopic);
+            client.subscribe(sensorsTopic, qos);
+            logger.info("MQTT connected and subscribed to {} and {}", edgeTopic, sensorsTopic);
         } catch (MqttException e) {
             logger.warn("Initial MQTT connection failed, retrying in background: {}", e.getMessage());
             reconnectAsync(client, options);
@@ -113,6 +117,7 @@ public class MqttConfig {
                     if (!client.isConnected()) {
                         client.connect(options);
                         client.subscribe(edgeTopic, qos);
+                        client.subscribe(sensorsTopic, qos);
                         logger.info("MQTT reconnected on attempt {}", retry);
                         return;
                     }

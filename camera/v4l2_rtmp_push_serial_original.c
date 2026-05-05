@@ -21,7 +21,7 @@
 #define DEFAULT_HEIGHT 240
 #define DEFAULT_FPS 15
 #define DEFAULT_FRAMES 0
-#define DEFAULT_RTMP_URL "rtmp://127.0.0.1:1935/myapp/stream"
+#define DEFAULT_RTMP_URL "rtmp://192.168.1.10:1935/myapp/stream"
 #define BUFFER_COUNT 4
 
 struct buffer {
@@ -57,7 +57,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s [device] [rtmp_url] [width] [height] [fps] [frames]\n"
-            "Example: %s /dev/video0 rtmp://127.0.0.1:1935/myapp/stream 320 240 15 0\n",
+            "Example: %s /dev/video0 rtmp://192.168.1.10:1935/myapp/stream 320 240 15 0\n",
             prog, prog);
 }
 

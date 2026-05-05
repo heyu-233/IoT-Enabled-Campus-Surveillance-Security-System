@@ -15,6 +15,7 @@ const cameraStore = useCameraStore()
 onMounted(async () => {
   await cameraStore.loadCameras()
   if (cameraStore.selectedCameraId) await cameraStore.selectCamera(cameraStore.selectedCameraId)
+  cameraStore.connectLightStream()
 })
 
 const selectedCamera = computed(() => cameraStore.selectedCamera)
@@ -74,6 +75,7 @@ const submitCamera = async () => {
           <div class="stream-command-deck__chips">
             <StatusPill :value="selectedCamera?.status || 'OFFLINE'" />
             <StatusPill :value="cameraStore.selectedDetectionRunning ? 'ACTIVE' : 'STOPPED'" />
+            <StatusPill :value="cameraStore.lightConnected ? cameraStore.lightLevelLabel : 'disconnected'" />
           </div>
         </div>
 
@@ -107,6 +109,20 @@ const submitCamera = async () => {
               </button>
               <button class="ghost-button danger" type="button" :disabled="!selectedCamera?.deviceId || cameraStore.detectorPending || !cameraStore.selectedDetectionRunning" @click="cameraStore.stopDetection()">
                 Stop Detection
+              </button>
+            </div>
+          </div>
+
+          <div class="stream-command-group">
+            <span class="stream-command-group__label">{{ t('monitoring.alarm') }}</span>
+            <div class="stream-command-group__buttons">
+              <button
+                class="primary-button emergency"
+                type="button"
+                :disabled="!selectedCamera?.deviceId"
+                @click="cameraStore.triggerAlarm()"
+              >
+                {{ t('monitoring.triggerAlarm') }}
               </button>
             </div>
           </div>

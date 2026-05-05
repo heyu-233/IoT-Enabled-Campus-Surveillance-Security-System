@@ -1,18 +1,14 @@
 #!/bin/sh
 
-MQTT_HOST="${MQTT_HOST:-127.0.0.1}"
-MQTT_PORT="${MQTT_PORT:-1883}"
-RTMP_URL="${RTMP_URL:-rtmp://127.0.0.1:1935/myapp/stream}"
-NET_CHECK_HOST="${NET_CHECK_HOST:-127.0.0.1}"
-MOSQUITTO_PUB_BIN="${MOSQUITTO_PUB_BIN:-/root/mosquitto_pub}"
-MOSQUITTO_SUB_BIN="${MOSQUITTO_SUB_BIN:-/root/mosquitto_sub}"
-NET_UP_SCRIPT="${NET_UP_SCRIPT:-/root/net_up.sh}"
+MQTT_HOST="192.168.1.10"
+MQTT_PORT="1883"
 
 STREAM_PROC="v4l2_rtmp_push"
-STREAM_CMD="/root/v4l2_rtmp_push /dev/video0 ${RTMP_URL} 320 240 15 0"
+STREAM_CMD="/root/v4l2_rtmp_push /dev/video0 rtmp://192.168.1.10:1935/myapp/stream 320 240 15 0"
 
 LOCK_FILE="/tmp/edge_agent.lock"
 HEARTBEAT_INTERVAL=5
+LIGHT_INTERVAL=1
 
 export LD_LIBRARY_PATH=/root:$LD_LIBRARY_PATH
 
@@ -40,11 +36,14 @@ cleanup() {
     if [ -n "$HB_PID" ]; then
         kill "$HB_PID" 2>/dev/null
     fi
+    if [ -n "$LIGHT_PID" ]; then
+        kill "$LIGHT_PID" 2>/dev/null
+    fi
     exit 0
 }
 
 network_ok() {
-    ping -c 1 "$NET_CHECK_HOST" >/dev/null 2>&1
+    ping -c 1 192.168.1.10 >/dev/null 2>&1
 }
 
 ensure_network() {
@@ -53,7 +52,7 @@ ensure_network() {
     fi
 
     log "network not ready, reconfig eth0"
-    "$NET_UP_SCRIPT" >/root/net_up.log 2>&1
+    /root/net_up.sh >/root/net_up.log 2>&1
     sleep 2
 
     if network_ok; then
@@ -100,19 +99,84 @@ stop_stream() {
     fi
 }
 
+ALARM_PID=""
+ALARM_COOLDOWN=6
+LAST_ALARM_TIME=0
+
+trigger_alarm() {
+    NOW=$(date +%s)
+    if [ $((NOW - LAST_ALARM_TIME)) -lt $ALARM_COOLDOWN ]; then
+        log "alarm cooldown active, skipping ($((ALARM_COOLDOWN - NOW + LAST_ALARM_TIME))s remaining)"
+        return
+    fi
+    LAST_ALARM_TIME=$NOW
+    log "alarm triggered"
+
+    for pid in $ALARM_PID; do
+        [ -n "$pid" ] && kill $pid 2>/dev/null
+        wait $pid 2>/dev/null
+    done
+
+    (
+        echo 255 > /sys/class/leds/sys-led/brightness
+        sleep 6
+        echo 0 > /sys/class/leds/sys-led/brightness
+    ) &
+    LED_PID=$!
+
+    (
+        for i in 1 2 3; do
+            echo 255 > /sys/class/leds/beep/brightness
+            sleep 1
+            echo 0 > /sys/class/leds/beep/brightness
+            sleep 1
+        done
+    ) &
+    BEEP_PID=$!
+    ALARM_PID="$LED_PID $BEEP_PID"
+}
+
 buzzer_on() {
-    log "buzzer on"
-    # TODO: replace with the real buzzer control command.
+    trigger_alarm
 }
 
 buzzer_off() {
     log "buzzer off"
-    # TODO: replace with the real buzzer off command.
+    for pid in $ALARM_PID; do
+        [ -n "$pid" ] && kill $pid 2>/dev/null
+        wait $pid 2>/dev/null
+    done
+    ALARM_PID=""
+    echo 0 > /sys/class/leds/beep/brightness
+    echo 0 > /sys/class/leds/sys-led/brightness
 }
 
 led_blink() {
-    log "led blink"
-    # TODO: replace with the real LED blink command.
+    trigger_alarm
+}
+
+poll_light_sensor() {
+    i2cset -y 0 0x1e 0x00 0x00 2>/dev/null  # 复位
+    sleep 0.5
+    i2cset -y 0 0x1e 0x00 0x01 2>/dev/null  # 激活ALS
+    sleep 0.5
+    while true; do
+        l=$(i2cget -y 0 0x1e 0x0c b 2>/dev/null | sed 's/^0x//')
+        h=$(i2cget -y 0 0x1e 0x0d b 2>/dev/null | sed 's/^0x//')
+        if [ -n "$h" ] && [ -n "$l" ]; then
+            val=$(( (0x$h * 256) + 0x$l ))
+            /root/mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
+                -t sensors/light \
+                -m "{\"device_id\":\"edge\",\"als_value\":$val}"
+        fi
+        sleep "$LIGHT_INTERVAL"
+    done
+}
+
+camera_adjust() {
+    gamma="$1"
+    echo "$gamma" > /tmp/camera_gamma
+    log "camera gamma set to $gamma"
 }
 
 publish_heartbeat() {
@@ -124,7 +188,7 @@ publish_heartbeat() {
             STREAMING=false
         fi
 
-        "$MOSQUITTO_PUB_BIN" -h "$MQTT_HOST" -p "$MQTT_PORT" \
+        /root/mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
           -t edge/heartbeat \
           -m "{\"device\":\"edge\",\"alive\":true,\"streaming\":$STREAMING}"
 
@@ -144,12 +208,16 @@ trap cleanup INT TERM
 publish_heartbeat &
 HB_PID=$!
 
-"$MOSQUITTO_SUB_BIN" -h "$MQTT_HOST" -p "$MQTT_PORT" \
+poll_light_sensor &
+LIGHT_PID=$!
+
+/root/mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" \
   -t edge/stream/start \
   -t edge/stream/stop \
   -t edge/buzzer/on \
   -t edge/buzzer/off \
-  -t edge/led/blink -v | \
+  -t edge/led/blink \
+  -t edge/camera/adjust -v | \
 while read -r topic payload
 do
     case "$topic" in
@@ -167,6 +235,10 @@ do
             ;;
         edge/led/blink)
             led_blink
+            ;;
+        edge/camera/adjust)
+            gamma=$(echo "$payload" | sed 's/.*"gamma":\([0-9.]*\).*/\1/')
+            camera_adjust "$gamma"
             ;;
         *)
             log "unknown topic: $topic payload: $payload"

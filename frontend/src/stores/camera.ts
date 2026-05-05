@@ -224,6 +224,52 @@ export const useCameraStore = defineStore('camera', () => {
     }
   }
 
+  const triggerAlarm = async () => {
+    const deviceId = selectedDeviceId.value
+    if (!deviceId) return
+    const uiStore = useUiStore()
+    const response = await edgeApi.buzzerOn(deviceId)
+    uiStore.pushToast(response.success ? 'Alarm triggered.' : 'Alarm failed.', response.success ? 'success' : 'danger')
+  }
+
+  const lightAlsValue = ref(0)
+  const lightLevel = ref(0)
+  const lightConnected = ref(false)
+  let lightEventSource: EventSource | null = null
+
+  const lightLevelLabel = computed(() => {
+    if (lightLevel.value === 2) return 'very-dark'
+    if (lightLevel.value === 1) return 'slightly-dark'
+    if (lightLevel.value === -1) return 'slightly-bright'
+    if (lightLevel.value === -2) return 'very-bright'
+    return 'normal'
+  })
+
+  const connectLightStream = () => {
+    if (lightEventSource) return
+    const base = import.meta.env.VITE_API_BASE_URL || '/api'
+    lightEventSource = new EventSource(`${base}/behaviors/light/stream`)
+    lightEventSource.onopen = () => { lightConnected.value = true }
+    lightEventSource.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data)
+        lightAlsValue.value = payload.alsValue ?? 0
+        lightLevel.value = payload.level ?? 0
+      } catch { /* ignore parse errors */ }
+    }
+    lightEventSource.onerror = () => {
+      lightConnected.value = false
+      lightEventSource?.close()
+      lightEventSource = null
+    }
+  }
+
+  const disconnectLightStream = () => {
+    lightConnected.value = false
+    lightEventSource?.close()
+    lightEventSource = null
+  }
+
   const setStreamPresence = (connected: boolean) => {
     playerConnected.value = connected
   }
@@ -232,6 +278,7 @@ export const useCameraStore = defineStore('camera', () => {
     cameras,
     selectedCameraId,
     selectedCamera,
+    selectedDeviceId,
     selectedStreamUrl,
     selectedStreamToken,
     loading,
@@ -252,6 +299,13 @@ export const useCameraStore = defineStore('camera', () => {
     stopStream,
     startDetection,
     stopDetection,
+    triggerAlarm,
     setStreamPresence,
+    lightAlsValue,
+    lightLevel,
+    lightConnected,
+    lightLevelLabel,
+    connectLightStream,
+    disconnectLightStream,
   }
 })

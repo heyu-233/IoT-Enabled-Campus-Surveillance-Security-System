@@ -13,7 +13,7 @@
 
 
 #define DEFAULT_DEVICE "/dev/video0"
-#define DEFAULT_URL "rtmp://127.0.0.1:1935/myapp/stream"
+#define DEFAULT_URL "rtmp://192.168.1.10:1935/myapp/stream"
 #define DEFAULT_WIDTH 320
 #define DEFAULT_HEIGHT 240
 #define DEFAULT_FPS 15

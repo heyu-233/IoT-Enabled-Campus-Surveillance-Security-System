@@ -1,11 +1,11 @@
 package com.example.end_part.service;
 
 import com.example.end_part.config.MqttConfig;
+import com.example.end_part.controller.SseController;
 import com.example.end_part.entity.Alert;
 import com.example.end_part.entity.Behavior;
 import com.example.end_part.entity.Camera;
 import com.example.end_part.mapper.AlertMapper;
-import com.example.end_part.mapper.BehaviorMapper;
 import com.example.end_part.mapper.CameraMapper;
 import com.example.end_part.utils.ImageUtils;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -29,7 +29,13 @@ public class MqttMessageService {
     private static final Logger logger = LoggerFactory.getLogger(MqttMessageService.class);
 
     @Autowired
-    private BehaviorMapper behaviorMapper;
+    private DetectionService detectionService;
+
+    @Autowired
+    private SseController sseController;
+
+    @Autowired
+    private BehaviorService behaviorService;
 
     @Autowired
     private AlertMapper alertMapper;
@@ -47,16 +53,13 @@ public class MqttMessageService {
     @Value("${mqtt.topic.buzzer:edge/control/buzzer}")
     private String buzzerTopic;
 
-    @Value("${alert.auto.threshold:0.8}")
-    private double alertThreshold;
-
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public void handleMessage(String topic, String payload) {
         logger.info("Received MQTT message on topic {}", topic);
         try {
             if (topic.startsWith("edge/detection/")) {
-                handleDetectionResult(payload);
+                detectionService.processDetection(payload);
             } else if (topic.startsWith("edge/alerts/")) {
                 handleEdgeAlert(payload);
             } else if (topic.startsWith("sensors/")) {
@@ -65,65 +68,13 @@ public class MqttMessageService {
                 handleAlertData(topic, payload);
             } else if (topic.equals("edge/heartbeat")) {
                 handleHeartbeat(payload);
+            } else if (topic.startsWith("edge/camera/")) {
+                // camera commands are consumed by the edge device, no server-side action
             } else {
                 logger.warn("Unhandled MQTT topic pattern: {}", topic);
             }
         } catch (Exception e) {
             logger.error("Failed to process MQTT payload on topic {}", topic, e);
-        }
-    }
-
-    private void handleDetectionResult(String payload) {
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> data = objectMapper.readValue(payload, Map.class);
-            String deviceId = (String) data.get("device_id");
-            Long timestamp = extractTimestamp(data);
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> detections = (List<Map<String, Object>>) data.get("detections");
-
-            Camera camera = resolveCamera(deviceId);
-            if (camera == null) {
-                logger.warn("Skipping detection result because device_id {} is not bound to a camera", deviceId);
-                return;
-            }
-
-            markCameraOnline(camera);
-            SavedImages savedImages = saveImages(data, "detection");
-
-            if (detections == null || detections.isEmpty()) {
-                logger.info("Detection payload for device {} contained no detections", deviceId);
-                return;
-            }
-
-            for (Map<String, Object> detection : detections) {
-                Object confidenceValue = detection.get("confidence");
-                if (!(confidenceValue instanceof Number confidenceNumber)) {
-                    logger.warn("Skipping malformed detection without confidence: {}", detection);
-                    continue;
-                }
-
-                String className = String.valueOf(detection.getOrDefault("class", "unknown"));
-                Double confidence = confidenceNumber.doubleValue();
-
-                Behavior behavior = new Behavior();
-                behavior.setCameraId(camera.getId());
-                behavior.setType(className);
-                behavior.setDescription("Detected: " + className);
-                behavior.setImageUrl(savedImages.processedImageUrl());
-                behavior.setProcessedImageUrl(savedImages.processedImageUrl());
-                behavior.setOriginalImageUrl(savedImages.originalImageUrl());
-                behavior.setConfidence(confidence);
-                behavior.setOccurredAt(toOccurredAt(timestamp));
-                behavior.setCreatedAt(LocalDateTime.now());
-                behaviorMapper.insert(behavior);
-
-                if (confidence >= alertThreshold) {
-                    createAlertFromBehavior(behavior, className, confidence);
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Failed to handle detection result payload", e);
         }
     }
 
@@ -155,8 +106,7 @@ public class MqttMessageService {
             behavior.setOriginalImageUrl(savedImages.originalImageUrl());
             behavior.setConfidence(1.0);
             behavior.setOccurredAt(toOccurredAt(timestamp));
-            behavior.setCreatedAt(LocalDateTime.now());
-            behaviorMapper.insert(behavior);
+            behaviorService.addBehavior(behavior);
 
             Alert alert = new Alert();
             alert.setBehaviorId(behavior.getId());
@@ -170,24 +120,6 @@ public class MqttMessageService {
         } catch (Exception e) {
             logger.error("Failed to handle edge alert payload", e);
         }
-    }
-
-    private void createAlertFromBehavior(Behavior behavior, String className, Double confidence) {
-        Alert alert = new Alert();
-        alert.setBehaviorId(behavior.getId());
-        alert.setType(className);
-        if (confidence >= 0.95) {
-            alert.setSeverity("HIGH");
-        } else if (confidence >= 0.85) {
-            alert.setSeverity("MEDIUM");
-        } else {
-            alert.setSeverity("LOW");
-        }
-        alert.setStatus("UNPROCESSED");
-        alert.setDescription("Auto alert: detected " + className + " with confidence " + String.format("%.2f", confidence));
-        alert.setCreatedAt(LocalDateTime.now());
-        alertMapper.insert(alert);
-        publishBuzzerSignal();
     }
 
     private Camera resolveCamera(String deviceId) {
@@ -264,7 +196,33 @@ public class MqttMessageService {
     }
 
     private void handleSensorData(String topic, String payload) {
-        logger.info("Sensor topic {} payload {}", topic, payload);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = objectMapper.readValue(payload, Map.class);
+            Object alsObj = data.get("als_value");
+            if (!(alsObj instanceof Number alsNumber)) return;
+            int als = alsNumber.intValue();
+
+            float gamma; int level;
+            if      (als < 50)   { gamma = 0.55f; level = 5; }
+            else if (als < 100)  { gamma = 0.65f; level = 4; }
+            else if (als < 200)  { gamma = 0.72f; level = 3; }
+            else if (als < 400)  { gamma = 0.82f; level = 2; }
+            else if (als < 800)  { gamma = 0.91f; level = 1; }
+            else if (als < 1500) { gamma = 1.00f; level = 0; }
+            else if (als < 3000) { gamma = 1.10f; level = -1; }
+            else if (als < 5000) { gamma = 1.20f; level = -2; }
+            else if (als < 8000) { gamma = 1.35f; level = -3; }
+            else                 { gamma = 1.50f; level = -4; }
+
+            String cmd = String.format("{\"gamma\":%.2f}", gamma);
+            mqttPublisher.publish("edge/camera/adjust", cmd);
+            sseController.broadcastLightStatus(als, level);
+
+            logger.info("Light sensor: als={} gamma={} level={}", als, gamma, level);
+        } catch (Exception e) {
+            logger.error("Failed to handle sensor data", e);
+        }
     }
 
     private void handleAlertData(String topic, String payload) {

@@ -2,9 +2,8 @@
 """
 Persistent detector supervisor for the Windows edge node.
 
-The process stays alive after startup, subscribes to MQTT control commands,
-and toggles inference on/off without spawning a new temporary process for
-every start/stop request.
+The process stays alive after startup, accepts HTTP control commands,
+and forwards detection results to the Spring Boot backend via HTTP POST.
 """
 
 from __future__ import annotations
@@ -17,13 +16,13 @@ import os
 import signal
 import threading
 import time
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import cv2
-import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 
 
@@ -34,8 +33,7 @@ class DetectorSupervisor:
     def __init__(
         self,
         rtmp_url: str,
-        mqtt_broker: str,
-        mqtt_port: int,
+        backend_url: str,
         model_path: str,
         detect_fps: int,
         device_id: str,
@@ -45,8 +43,7 @@ class DetectorSupervisor:
         dedupe_iou_threshold: float,
     ) -> None:
         self.rtmp_url = rtmp_url
-        self.mqtt_broker = mqtt_broker
-        self.mqtt_port = mqtt_port
+        self.backend_url = backend_url
         self.model_path = model_path
         self.detect_fps = max(1, detect_fps)
         self.device_id = device_id
@@ -63,7 +60,6 @@ class DetectorSupervisor:
 
         self.model: YOLO | None = None
         self.capture: cv2.VideoCapture | None = None
-        self.mqtt_client: mqtt.Client | None = None
         self.worker_thread: threading.Thread | None = None
         self.http_server: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
@@ -84,27 +80,6 @@ class DetectorSupervisor:
         LOGGER.info("Loading YOLO model from %s", resolved_path)
         self.model = YOLO(resolved_path)
         self.model_path = resolved_path
-
-    def init_mqtt(self) -> None:
-        client = mqtt.Client(client_id=f"detector-supervisor-{self.device_id}")
-        client.on_connect = self.on_connect
-        client.on_disconnect = self.on_disconnect
-        client.reconnect_delay_set(min_delay=1, max_delay=30)
-
-        LOGGER.info("Connecting MQTT broker %s:%s", self.mqtt_broker, self.mqtt_port)
-        client.connect(self.mqtt_broker, self.mqtt_port, keepalive=60)
-        client.loop_start()
-        self.mqtt_client = client
-
-    def on_connect(self, client: mqtt.Client, _userdata: Any, _flags: Any, rc: int) -> None:
-        if rc == 0:
-            LOGGER.info("MQTT connected for detection result publishing")
-        else:
-            LOGGER.error("MQTT connect failed with rc=%s", rc)
-
-    def on_disconnect(self, _client: mqtt.Client, _userdata: Any, rc: int) -> None:
-        if rc != 0 and not self.shutdown_event.is_set():
-            LOGGER.warning("MQTT disconnected unexpectedly, client will retry")
 
     def start_detection(self, payload: dict[str, Any] | None = None) -> None:
         if payload:
@@ -166,7 +141,6 @@ class DetectorSupervisor:
 
     def run(self) -> None:
         self.load_model()
-        self.init_mqtt()
         self.start_http_server()
 
         self.worker_thread = threading.Thread(target=self._detection_loop, name="detector-worker", daemon=True)
@@ -188,12 +162,6 @@ class DetectorSupervisor:
         self.shutdown_event.set()
         self.detect_enabled.clear()
         self._close_capture()
-
-        if self.mqtt_client is not None:
-            try:
-                self.mqtt_client.loop_stop()
-            finally:
-                self.mqtt_client.disconnect()
 
         if self.worker_thread is not None and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5.0)
@@ -286,8 +254,8 @@ class DetectorSupervisor:
             "original_image": self._encode_frame(frame),
             "processed_image": self._encode_frame(annotated_frame),
         }
-        self._publish_detection(payload)
-        LOGGER.info("Published %s detections (total runs=%s)", len(detections), self.detect_count)
+        self._post_detection(payload)
+        LOGGER.info("Posted %s detections (total runs=%s)", len(detections), self.detect_count)
 
     def _filter_duplicate_detections(self, detections: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
         if not detections:
@@ -437,12 +405,19 @@ class DetectorSupervisor:
             return None
         return base64.b64encode(buffer).decode("utf-8")
 
-    def _publish_detection(self, payload: dict[str, Any]) -> None:
-        if self.mqtt_client is None:
-            raise RuntimeError("mqtt client is not initialized")
-
+    def _post_detection(self, payload: dict[str, Any]) -> None:
         message = {key: value for key, value in payload.items() if value is not None}
-        self.mqtt_client.publish("edge/detection/results", json.dumps(message, ensure_ascii=False), qos=1)
+        data = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self.backend_url,
+            data=data,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            LOGGER.warning("Failed to post detection to backend", exc_info=True)
 
     def _sleep_with_shutdown(self, seconds: float) -> None:
         deadline = time.time() + seconds
@@ -520,13 +495,12 @@ class DetectorSupervisor:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Persistent MQTT-controlled YOLO detector supervisor")
+    parser = argparse.ArgumentParser(description="Persistent YOLO detector supervisor")
     parser.add_argument("--rtmp", default=os.getenv("DETECTOR_RTMP_URL", "rtmp://127.0.0.1/myapp/stream"))
-    parser.add_argument("--mqtt", default=os.getenv("DETECTOR_MQTT_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("DETECTOR_MQTT_PORT", "1883")))
+    parser.add_argument("--backend-url", default=os.getenv("DETECTOR_BACKEND_URL", "http://127.0.0.1:8081/api/detections"))
     parser.add_argument("--model", default=os.getenv("DETECTOR_MODEL_PATH", "best.pt"))
     parser.add_argument("--fps", type=int, default=int(os.getenv("DETECTOR_FPS", "5")))
-    parser.add_argument("--device", default=os.getenv("DETECTOR_DEVICE_ID", "edge-node-001"))
+    parser.add_argument("--device", default=os.getenv("DETECTOR_DEVICE_ID", "windows-edge-001"))
     parser.add_argument("--retry-seconds", type=float, default=float(os.getenv("DETECTOR_RETRY_SECONDS", "3")))
     parser.add_argument("--jpeg-quality", type=int, default=int(os.getenv("DETECTOR_JPEG_QUALITY", "70")))
     parser.add_argument("--dedupe-window-seconds", type=float, default=float(os.getenv("DETECTOR_DEDUPE_WINDOW_SECONDS", "8")))
@@ -547,8 +521,7 @@ def main() -> int:
 
     supervisor = DetectorSupervisor(
         rtmp_url=args.rtmp,
-        mqtt_broker=args.mqtt,
-        mqtt_port=args.port,
+        backend_url=args.backend_url,
         model_path=args.model,
         detect_fps=args.fps,
         device_id=args.device,

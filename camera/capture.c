@@ -11,6 +11,8 @@
 #include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <math.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BUFFER_COUNT 4
@@ -222,6 +224,39 @@ int capture_requeue(struct capture_context *cap, unsigned int index)
     return 0;
 }
 
+static unsigned char gamma_lut[256];
+static float gamma_value = 1.0f;
+static time_t gamma_last_read = 0;
+
+static void build_gamma_lut(float g)
+{
+    int i;
+    for (i = 0; i < 256; i++) {
+        float n = (float)i / 255.0f;
+        float c = powf(n, g);
+        int v = (int)(c * 255.0f + 0.5f);
+        gamma_lut[i] = (unsigned char)(v > 255 ? 255 : (v < 0 ? 0 : v));
+    }
+}
+
+static void read_gamma_value(void)
+{
+    time_t now = time(NULL);
+    if (now == gamma_last_read) return;
+    gamma_last_read = now;
+
+    FILE *f = fopen("/tmp/camera_gamma", "r");
+    if (!f) {
+        if (gamma_value != 1.0f) { gamma_value = 1.0f; build_gamma_lut(1.0f); }
+        return;
+    }
+    float g;
+    if (fscanf(f, "%f", &g) == 1 && g >= 0.3f && g <= 2.5f) {
+        if (g != gamma_value) { gamma_value = g; build_gamma_lut(g); }
+    }
+    fclose(f);
+}
+
 void capture_yuyv_to_yuv420p(const unsigned char *src, AVFrame *frame,
                              unsigned int width, unsigned int height)
 {
@@ -234,24 +269,45 @@ void capture_yuyv_to_yuv420p(const unsigned char *src, AVFrame *frame,
     int stride_u = frame->linesize[1];
     int stride_v = frame->linesize[2];
 
-    for (y = 0; y < height; y += 2) {
-        const unsigned char *line0 = src + y * width * 2;
-        const unsigned char *line1 = src + (y + 1) * width * 2;
-        unsigned char *out_y0 = dst_y + y * stride_y;
-        unsigned char *out_y1 = dst_y + (y + 1) * stride_y;
-        unsigned char *out_u = dst_u + (y / 2) * stride_u;
-        unsigned char *out_v = dst_v + (y / 2) * stride_v;
+    read_gamma_value();
 
-        for (x = 0; x < width; x += 2) {
-            unsigned int off = x * 2;
+    if (gamma_value == 1.0f) {
+        for (y = 0; y < height; y += 2) {
+            const unsigned char *line0 = src + y * width * 2;
+            const unsigned char *line1 = src + (y + 1) * width * 2;
+            unsigned char *out_y0 = dst_y + y * stride_y;
+            unsigned char *out_y1 = dst_y + (y + 1) * stride_y;
+            unsigned char *out_u = dst_u + (y / 2) * stride_u;
+            unsigned char *out_v = dst_v + (y / 2) * stride_v;
 
-            out_y0[x] = line0[off];
-            out_y0[x + 1] = line0[off + 2];
-            out_y1[x] = line1[off];
-            out_y1[x + 1] = line1[off + 2];
+            for (x = 0; x < width; x += 2) {
+                unsigned int off = x * 2;
+                out_y0[x]     = line0[off];
+                out_y0[x + 1] = line0[off + 2];
+                out_y1[x]     = line1[off];
+                out_y1[x + 1] = line1[off + 2];
+                out_u[x / 2]  = line0[off + 1];
+                out_v[x / 2]  = line0[off + 3];
+            }
+        }
+    } else {
+        for (y = 0; y < height; y += 2) {
+            const unsigned char *line0 = src + y * width * 2;
+            const unsigned char *line1 = src + (y + 1) * width * 2;
+            unsigned char *out_y0 = dst_y + y * stride_y;
+            unsigned char *out_y1 = dst_y + (y + 1) * stride_y;
+            unsigned char *out_u = dst_u + (y / 2) * stride_u;
+            unsigned char *out_v = dst_v + (y / 2) * stride_v;
 
-            out_u[x / 2] = line0[off + 1];
-            out_v[x / 2] = line0[off + 3];
+            for (x = 0; x < width; x += 2) {
+                unsigned int off = x * 2;
+                out_y0[x]     = gamma_lut[line0[off]];
+                out_y0[x + 1] = gamma_lut[line0[off + 2]];
+                out_y1[x]     = gamma_lut[line1[off]];
+                out_y1[x + 1] = gamma_lut[line1[off + 2]];
+                out_u[x / 2]  = line0[off + 1];
+                out_v[x / 2]  = line0[off + 3];
+            }
         }
     }
 }

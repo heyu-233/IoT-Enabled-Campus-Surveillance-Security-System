@@ -11,8 +11,8 @@ export default {
   },
   nav: { overview: 'Overview', monitoring: 'Monitoring', alerts: 'Alerts', behaviors: 'Behaviors', analytics: 'Analytics', system: 'System', logout: 'Logout' },
   auth: {
-    signIn: 'Sign in', username: 'Username', password: 'Password', remember: 'Keep this session active on this device',
-    helper: 'Use your backend account to access live monitoring and management tools.',
+    signIn: 'Sign in', username: 'Username', password: 'Password', remember: 'Keep this session ready for demos',
+    helper: 'Use your backend account to access live monitoring and admin tools.',
     tagline: 'Realtime campus awareness for operators and administrators.',
     email: 'Email',
     confirmPassword: 'Confirm password',
@@ -34,6 +34,8 @@ export default {
   monitoring: {
     title: 'Live monitoring', subtitle: 'Review camera health, playback streams, and update device details.',
     addCamera: 'Add camera', editCamera: 'Edit camera', cameraDirectory: 'Camera directory', streamWindow: 'Stream window',
+    alarm: 'Alarm', triggerAlarm: 'Trigger Alarm',
+    lightLevel: 'Ambient Light', lightNormal: 'Normal', lightSlightlyDark: 'Slightly Dark', lightVeryDark: 'Very Dark', lightSlightlyBright: 'Slightly Bright', lightVeryBright: 'Very Bright',
     details: 'Device details', refreshStatus: 'Refresh status', loadStream: 'Load stream',
     emptyStream: 'Select a camera to preview its stream.', lastActive: 'Last active', ipAddress: 'IP address',
     port: 'Port', name: 'Camera name', streamUrl: 'Stream URL'

@@ -16,6 +16,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class SseController {
 
     private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+    private final List<SseEmitter> lightEmitters = new CopyOnWriteArrayList<>();
 
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter subscribe() {
@@ -25,6 +26,18 @@ public class SseController {
         emitter.onCompletion(() -> emitters.remove(emitter));
         emitter.onError(e -> emitters.remove(emitter));
         emitter.onTimeout(() -> emitters.remove(emitter));
+
+        return emitter;
+    }
+
+    @GetMapping(value = "/light/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter lightStream() {
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        lightEmitters.add(emitter);
+
+        emitter.onCompletion(() -> lightEmitters.remove(emitter));
+        emitter.onError(e -> lightEmitters.remove(emitter));
+        emitter.onTimeout(() -> lightEmitters.remove(emitter));
 
         return emitter;
     }
@@ -39,5 +52,18 @@ public class SseController {
             }
         });
         emitters.removeAll(deadEmitters);
+    }
+
+    public void broadcastLightStatus(int alsValue, int level) {
+        String data = String.format("{\"alsValue\":%d,\"level\":%d}", alsValue, level);
+        List<SseEmitter> deadEmitters = new ArrayList<>();
+        lightEmitters.forEach(emitter -> {
+            try {
+                emitter.send(SseEmitter.event().data(data));
+            } catch (IOException e) {
+                deadEmitters.add(emitter);
+            }
+        });
+        lightEmitters.removeAll(deadEmitters);
     }
 }

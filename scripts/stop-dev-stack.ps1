@@ -20,6 +20,42 @@ function Write-Step {
   Write-Host "[iot-stack] $Message"
 }
 
+function Get-LocalNginxProcesses {
+  if (-not (Test-Path $nginxExe)) {
+    return @()
+  }
+
+  return @(Get-Process nginx -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path -ieq $nginxExe
+  })
+}
+
+function Stop-LocalNginx {
+  $localNginx = Get-LocalNginxProcesses
+  if ($localNginx.Count -eq 0) {
+    Write-Step 'Local Nginx is already stopped.'
+    return
+  }
+
+  try {
+    & $nginxExe -p $nginxRoot -c conf/nginx.conf -s quit | Out-Null
+    Write-Step 'Local Nginx stop signal sent.'
+  } catch {
+    Write-Step 'Local Nginx quit signal failed, forcing shutdown.'
+  }
+
+  $deadline = (Get-Date).AddSeconds(10)
+  do {
+    Start-Sleep -Milliseconds 500
+    $localNginx = Get-LocalNginxProcesses
+  } while ($localNginx.Count -gt 0 -and (Get-Date) -lt $deadline)
+
+  if ($localNginx.Count -gt 0) {
+    $localNginx | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Step 'Forced shutdown of local Nginx processes.'
+  }
+}
+
 function Stop-ManagedProcess {
   param(
     [string]$Name,
@@ -72,15 +108,12 @@ if ($IncludeNginx) {
     } else {
       Write-Step "Nginx service $nginxServiceName is already stopped."
     }
-  } elseif ((Test-Path $nginxExe) -and (Test-Path $nginxConf)) {
-    try {
-      & $nginxExe -p $nginxRoot -c conf/nginx.conf -s quit | Out-Null
-      Write-Step 'Local Nginx stop signal sent.'
-    } catch {
-      Write-Step 'Local Nginx was not running or could not be stopped cleanly.'
-    }
-  } else {
+  } elseif (-not ((Test-Path $nginxExe) -and (Test-Path $nginxConf))) {
     Write-Step 'Local Nginx binary not found, skipping.'
+  }
+
+  if ((Test-Path $nginxExe) -and (Test-Path $nginxConf)) {
+    Stop-LocalNginx
   }
 } else {
   Write-Step 'Local Nginx left running.'

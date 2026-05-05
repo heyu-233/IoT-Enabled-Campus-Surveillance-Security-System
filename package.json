@@ -8,6 +8,7 @@
     "dev:backend": "end_part\\mvnw.cmd -f end_part\\pom.xml spring-boot:run",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:stack": "powershell -ExecutionPolicy Bypass -File .\\scripts\\start-dev-stack.ps1",
+    "debug:status": "powershell -ExecutionPolicy Bypass -File .\\scripts\\debugctl.ps1 status",
     "stop": "powershell -ExecutionPolicy Bypass -File .\\scripts\\stop-dev-stack.ps1",
     "stop:stack": "powershell -ExecutionPolicy Bypass -File .\\scripts\\stop-dev-stack.ps1",
     "build:frontend": "npm --prefix frontend run build"
