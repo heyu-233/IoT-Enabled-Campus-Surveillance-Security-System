@@ -57,6 +57,9 @@ public class DetectionService {
     @Value("${alert.auto.threshold:0.8}")
     private double alertThreshold;
 
+    @Value("${alert.auto.threshold.fight:${alert.auto.threshold:0.8}}")
+    private double fightAlertThreshold;
+
     @Value("${alert.dedup.window.seconds:30}")
     private int alertDedupWindowSeconds;
 
@@ -202,7 +205,7 @@ public class DetectionService {
     private Set<String> reserveImmediateAlerts(Camera camera, List<DetectionCandidate> candidates) {
         Set<String> alertKeys = new HashSet<>();
         for (DetectionCandidate candidate : candidates) {
-            if (candidate.confidence() < alertThreshold) {
+            if (candidate.confidence() < thresholdFor(candidate.className())) {
                 continue;
             }
 
@@ -226,6 +229,10 @@ public class DetectionService {
 
     private String alertKey(Long cameraId, String className) {
         return cameraId + ":" + className;
+    }
+
+    private double thresholdFor(String className) {
+        return "fight".equalsIgnoreCase(className) ? fightAlertThreshold : alertThreshold;
     }
 
     private Camera resolveCamera(String deviceId) {

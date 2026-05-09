@@ -45,20 +45,18 @@ const submitCamera = async () => {
             'camera-card--ops',
             {
               'is-selected': camera.id === cameraStore.selectedCameraId,
-              'is-muted': camera.id !== cameraStore.testCameraId,
             },
           ]"
-          :disabled="camera.id !== cameraStore.testCameraId"
           @click="camera.id && cameraStore.selectCamera(camera.id)"
         >
           <div class="camera-card__meta">
-            <span class="camera-card__eyebrow">{{ camera.id === cameraStore.testCameraId ? 'Test Feed' : 'Standby Node' }}</span>
+            <span class="camera-card__eyebrow">{{ camera.id === cameraStore.testCameraId ? 'Edge RTMP Feed' : 'Demo Source' }}</span>
             <p>{{ camera.name }}</p>
             <span>{{ camera.location || '--' }}</span>
           </div>
           <div class="camera-card__badges">
             <StatusPill :value="camera.status" />
-            <span class="camera-card__lock">{{ camera.id === cameraStore.testCameraId ? 'Active console' : 'Offline reserve' }}</span>
+            <span class="camera-card__lock">{{ camera.id === cameraStore.selectedCameraId ? 'Selected console' : 'Available' }}</span>
           </div>
         </button>
       </div>
@@ -70,7 +68,7 @@ const submitCamera = async () => {
         <div class="stream-command-deck__status">
           <div class="stream-command-deck__headline">
             <span class="eyebrow">Command Deck</span>
-            <strong>{{ cameraStore.monitorLockedToTestCamera ? 'Test camera locked' : 'Awaiting camera profile' }}</strong>
+            <strong>{{ selectedCamera ? 'Camera source selected' : 'Awaiting camera profile' }}</strong>
           </div>
           <div class="stream-command-deck__chips">
             <StatusPill :value="selectedCamera?.status || 'OFFLINE'" />
@@ -130,6 +128,7 @@ const submitCamera = async () => {
       </div>
 
       <StreamPlayer
+        :key="cameraStore.selectedDeviceId || 'empty-stream'"
         :src="cameraStore.selectedStreamUrl"
         :reload-token="cameraStore.selectedStreamToken"
         :active="cameraStore.selectedStreamRunning"
@@ -148,7 +147,7 @@ const submitCamera = async () => {
         <div><span>{{ t('monitoring.lastActive') }}</span><strong>{{ selectedCamera.lastActive || '--' }}</strong></div>
         <div><span>Stream</span><strong>{{ selectedCamera.status === 'ONLINE' ? 'LIVE' : 'IDLE' }}</strong></div>
         <div><span>Detection</span><strong>{{ cameraStore.selectedDetectionRunning ? 'ARMED' : 'STANDBY' }}</strong></div>
-        <div><span>Console</span><strong>{{ cameraStore.monitorLockedToTestCamera ? 'TEST CAMERA ONLY' : 'WAITING' }}</strong></div>
+        <div><span>Console</span><strong>{{ selectedCamera ? 'MULTI-SOURCE DEMO' : 'WAITING' }}</strong></div>
       </div>
       <EmptyState v-else :title="t('app.noData')" :body="t('monitoring.emptyStream')" />
 

@@ -24,7 +24,14 @@ public class DetectorSupervisorClient {
     private String supervisorBaseUrl;
 
     public EdgeCommandResponse start(String deviceId) {
-        return post("/start", "{\"device_id\":\"" + deviceId + "\"}", "Detector started");
+        return start(deviceId, null);
+    }
+
+    public EdgeCommandResponse start(String deviceId, String payload) {
+        String requestBody = payload != null && !payload.isBlank()
+                ? payload
+                : "{\"device_id\":\"" + deviceId + "\"}";
+        return post("/start", requestBody, "Detector started");
     }
 
     public EdgeCommandResponse stop(String deviceId) {

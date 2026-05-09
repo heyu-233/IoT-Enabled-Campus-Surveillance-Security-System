@@ -17,6 +17,7 @@ import signal
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,35 @@ import torch
 
 
 LOGGER = logging.getLogger("detector-supervisor")
+
+
+@dataclass
+class StreamRuntime:
+    device_id: str
+    rtmp_url: str
+    detect_fps: int
+    retry_seconds: float
+    dedupe_window_seconds: float
+    dedupe_iou_threshold: float
+    detect_interval: float
+    detect_enabled: threading.Event = field(default_factory=threading.Event)
+    state_lock: threading.RLock = field(default_factory=threading.RLock)
+    frame_lock: threading.Lock = field(default_factory=threading.Lock)
+    frame_ready: threading.Condition = field(init=False)
+    capture: cv2.VideoCapture | None = None
+    capture_thread: threading.Thread | None = None
+    capture_interval: float = 0.0
+    latest_frame: Any = None
+    latest_frame_seq: int = 0
+    last_processed_seq: int = 0
+    last_result_at: float = 0.0
+    detect_count: int = 0
+    recent_detections: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    class_hit_history: dict[str, list[float]] = field(default_factory=dict)
+    last_reported_by_class: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.frame_ready = threading.Condition(self.frame_lock)
 
 
 class DetectorSupervisor:
@@ -83,6 +113,8 @@ class DetectorSupervisor:
         self.state_lock = threading.RLock()
         self.frame_lock = threading.Lock()
         self.frame_ready = threading.Condition(self.frame_lock)
+        self.streams_lock = threading.RLock()
+        self.streams: dict[str, StreamRuntime] = {}
         self._shutdown_started = False
 
         self.model: YOLO | None = None
@@ -119,6 +151,33 @@ class DetectorSupervisor:
             return "cpu"
 
         return requested_device
+
+    def _get_or_create_stream(self, device_id: str | None = None) -> StreamRuntime:
+        normalized_device_id = (device_id or self.device_id or "windows-edge-001").strip()
+        with self.streams_lock:
+            stream = self.streams.get(normalized_device_id)
+            if stream is not None:
+                return stream
+
+            stream = StreamRuntime(
+                device_id=normalized_device_id,
+                rtmp_url=self.rtmp_url,
+                detect_fps=self.detect_fps,
+                retry_seconds=self.retry_seconds,
+                dedupe_window_seconds=self.dedupe_window_seconds,
+                dedupe_iou_threshold=self.dedupe_iou_threshold,
+                detect_interval=1.0 / self.detect_fps,
+            )
+            self.streams[normalized_device_id] = stream
+            return stream
+
+    def _active_streams(self) -> list[StreamRuntime]:
+        with self.streams_lock:
+            return [stream for stream in self.streams.values() if stream.detect_enabled.is_set()]
+
+    def _all_streams(self) -> list[StreamRuntime]:
+        with self.streams_lock:
+            return list(self.streams.values())
 
     def load_model(self) -> None:
         model_candidate = Path(self.model_path)
@@ -179,70 +238,88 @@ class DetectorSupervisor:
         return YOLO(resolved_path), resolved_path
 
     def start_detection(self, payload: dict[str, Any] | None = None) -> None:
+        target_device = str((payload or {}).get("device_id", self.device_id)).strip() or self.device_id
+        stream = self._get_or_create_stream(target_device)
         if payload:
-            target_device = str(payload.get("device_id", "")).strip()
-            if target_device and target_device != self.device_id:
-                LOGGER.info("Switching active device_id from %s to %s", self.device_id, target_device)
-                self.device_id = target_device
             self.update_config(payload)
 
-        if self.detect_enabled.is_set():
-            LOGGER.info("Detection already enabled")
+        if stream.detect_enabled.is_set():
+            LOGGER.info("Detection already enabled for %s", stream.device_id)
             return
 
-        self.detect_enabled.set()
-        LOGGER.info("Detection enabled")
+        stream.detect_enabled.set()
+        if stream.capture_thread is None or not stream.capture_thread.is_alive():
+            stream.capture_thread = threading.Thread(
+                target=self._capture_loop,
+                args=(stream,),
+                name=f"detector-capture-{stream.device_id}",
+                daemon=True,
+            )
+            stream.capture_thread.start()
+        LOGGER.info("Detection enabled for %s", stream.device_id)
 
-    def stop_detection(self) -> None:
-        if not self.detect_enabled.is_set():
+    def stop_detection(self, payload: dict[str, Any] | None = None) -> None:
+        target_device = str((payload or {}).get("device_id", "")).strip()
+        if target_device:
+            streams = [self._get_or_create_stream(target_device)]
+        else:
+            streams = self._all_streams()
+
+        if not streams:
             LOGGER.info("Detection already disabled")
-            self._close_capture()
             return
 
-        self.detect_enabled.clear()
-        self.last_result_at = 0.0
-        self._close_capture()
-        self._clear_latest_frame()
-        LOGGER.info("Detection disabled")
+        for stream in streams:
+            if not stream.detect_enabled.is_set():
+                LOGGER.info("Detection already disabled for %s", stream.device_id)
+                self._close_capture(stream)
+                continue
+
+            stream.detect_enabled.clear()
+            stream.last_result_at = 0.0
+            self._close_capture(stream)
+            self._clear_latest_frame(stream)
+            LOGGER.info("Detection disabled for %s", stream.device_id)
 
     def update_config(self, payload: dict[str, Any]) -> None:
         if not payload:
             return
 
-        with self.state_lock:
+        target_device = str(payload.get("device_id", self.device_id)).strip() or self.device_id
+        stream = self._get_or_create_stream(target_device)
+
+        with stream.state_lock:
             new_rtmp = payload.get("rtmp_url")
-            if isinstance(new_rtmp, str) and new_rtmp.strip() and new_rtmp.strip() != self.rtmp_url:
-                self.rtmp_url = new_rtmp.strip()
-                LOGGER.info("Updated RTMP URL to %s", self.rtmp_url)
-                self._close_capture()
+            if isinstance(new_rtmp, str) and new_rtmp.strip() and new_rtmp.strip() != stream.rtmp_url:
+                stream.rtmp_url = new_rtmp.strip()
+                LOGGER.info("Updated video source for %s to %s", stream.device_id, stream.rtmp_url)
+                self._close_capture(stream)
 
             new_fps = payload.get("detect_fps")
             if isinstance(new_fps, (int, float)) and float(new_fps) > 0:
-                self.detect_fps = max(1, int(new_fps))
-                self.detect_interval = 1.0 / self.detect_fps
-                LOGGER.info("Updated detect_fps to %s", self.detect_fps)
+                stream.detect_fps = max(1, int(new_fps))
+                stream.detect_interval = 1.0 / stream.detect_fps
+                LOGGER.info("Updated detect_fps for %s to %s", stream.device_id, stream.detect_fps)
 
             new_retry = payload.get("retry_seconds")
             if isinstance(new_retry, (int, float)) and float(new_retry) > 0:
-                self.retry_seconds = max(1.0, float(new_retry))
-                LOGGER.info("Updated retry_seconds to %s", self.retry_seconds)
+                stream.retry_seconds = max(1.0, float(new_retry))
+                LOGGER.info("Updated retry_seconds for %s to %s", stream.device_id, stream.retry_seconds)
 
             new_dedupe_window = payload.get("dedupe_window_seconds")
             if isinstance(new_dedupe_window, (int, float)) and float(new_dedupe_window) > 0:
-                self.dedupe_window_seconds = max(0.5, float(new_dedupe_window))
-                LOGGER.info("Updated dedupe_window_seconds to %s", self.dedupe_window_seconds)
+                stream.dedupe_window_seconds = max(0.5, float(new_dedupe_window))
+                LOGGER.info("Updated dedupe_window_seconds for %s to %s", stream.device_id, stream.dedupe_window_seconds)
 
             new_dedupe_iou = payload.get("dedupe_iou_threshold")
             if isinstance(new_dedupe_iou, (int, float)) and 0 < float(new_dedupe_iou) < 1:
-                self.dedupe_iou_threshold = min(max(float(new_dedupe_iou), 0.1), 0.95)
-                LOGGER.info("Updated dedupe_iou_threshold to %s", self.dedupe_iou_threshold)
+                stream.dedupe_iou_threshold = min(max(float(new_dedupe_iou), 0.1), 0.95)
+                LOGGER.info("Updated dedupe_iou_threshold for %s to %s", stream.device_id, stream.dedupe_iou_threshold)
 
     def run(self) -> None:
         self.load_model()
         self.start_http_server()
 
-        self.capture_thread = threading.Thread(target=self._capture_loop, name="detector-capture", daemon=True)
-        self.capture_thread.start()
         self.inference_thread = threading.Thread(target=self._inference_loop, name="detector-inference", daemon=True)
         self.inference_thread.start()
 
@@ -261,13 +338,16 @@ class DetectorSupervisor:
         LOGGER.info("Shutting down detector supervisor")
         self.shutdown_event.set()
         self.detect_enabled.clear()
-        self._close_capture()
-        self._clear_latest_frame()
-        with self.frame_ready:
-            self.frame_ready.notify_all()
+        for stream in self._all_streams():
+            stream.detect_enabled.clear()
+            self._close_capture(stream)
+            self._clear_latest_frame(stream)
+            with stream.frame_ready:
+                stream.frame_ready.notify_all()
 
-        if self.capture_thread is not None and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=5.0)
+        for stream in self._all_streams():
+            if stream.capture_thread is not None and stream.capture_thread.is_alive():
+                stream.capture_thread.join(timeout=5.0)
         if self.inference_thread is not None and self.inference_thread.is_alive():
             self.inference_thread.join(timeout=5.0)
 
@@ -283,102 +363,156 @@ class DetectorSupervisor:
         except Exception:
             LOGGER.debug("destroyAllWindows failed during shutdown", exc_info=True)
 
-    def _ensure_capture(self) -> bool:
-        with self.state_lock:
-            if self.capture is not None and self.capture.isOpened():
+    def _ensure_capture(self, stream: StreamRuntime) -> bool:
+        with stream.state_lock:
+            if stream.capture is not None and stream.capture.isOpened():
                 return True
 
-            LOGGER.info("Opening RTMP stream %s", self.rtmp_url)
-            self.capture = cv2.VideoCapture(self.rtmp_url)
-            if self.capture is None or not self.capture.isOpened():
-                LOGGER.warning("Failed to open RTMP stream, retry in %.1fs", self.retry_seconds)
-                self._close_capture()
+            LOGGER.info("Opening video source for %s: %s", stream.device_id, stream.rtmp_url)
+            stream.capture = self._open_video_capture(stream.rtmp_url)
+            if stream.capture is None or not stream.capture.isOpened():
+                LOGGER.warning("Failed to open video source for %s, retry in %.1fs", stream.device_id, stream.retry_seconds)
+                self._close_capture(stream)
                 return False
 
-            LOGGER.info("RTMP stream connected")
+            stream.capture_interval = self._capture_interval_for_source(stream)
+            LOGGER.info("Video source connected for %s", stream.device_id)
             return True
 
-    def _close_capture(self) -> None:
-        with self.state_lock:
-            if self.capture is not None:
+    def _open_video_capture(self, source: str) -> cv2.VideoCapture:
+        normalized = source.strip()
+        if normalized.isdigit():
+            return cv2.VideoCapture(int(normalized))
+        return cv2.VideoCapture(normalized)
+
+    def _close_capture(self, stream: StreamRuntime) -> None:
+        with stream.state_lock:
+            if stream.capture is not None:
                 try:
-                    self.capture.release()
+                    stream.capture.release()
                 finally:
-                    self.capture = None
+                    stream.capture = None
 
-    def _store_latest_frame(self, frame: Any) -> None:
-        with self.frame_ready:
-            self.latest_frame = frame
-            self.latest_frame_seq += 1
-            self.frame_ready.notify()
+    def _store_latest_frame(self, stream: StreamRuntime, frame: Any) -> None:
+        with stream.frame_ready:
+            stream.latest_frame = frame
+            stream.latest_frame_seq += 1
+            stream.frame_ready.notify()
 
-    def _clear_latest_frame(self) -> None:
-        with self.frame_ready:
-            self.latest_frame = None
-            self.latest_frame_seq += 1
-            self.frame_ready.notify_all()
+    def _clear_latest_frame(self, stream: StreamRuntime) -> None:
+        with stream.frame_ready:
+            stream.latest_frame = None
+            stream.latest_frame_seq += 1
+            stream.frame_ready.notify_all()
 
-    def _read_frame(self) -> tuple[bool, Any]:
-        with self.state_lock:
-            if self.capture is None:
+    def _read_frame(self, stream: StreamRuntime) -> tuple[bool, Any]:
+        with stream.state_lock:
+            if stream.capture is None:
                 return False, None
-            return self.capture.read()
+            return stream.capture.read()
 
-    def _capture_loop(self) -> None:
+    def _capture_loop(self, stream: StreamRuntime) -> None:
         while not self.shutdown_event.is_set():
-            if not self.detect_enabled.wait(timeout=0.5):
-                self._close_capture()
-                self._clear_latest_frame()
+            if not stream.detect_enabled.wait(timeout=0.5):
+                self._close_capture(stream)
+                self._clear_latest_frame(stream)
                 continue
 
-            if not self._ensure_capture():
-                self._sleep_with_shutdown(self.retry_seconds)
+            if not self._ensure_capture(stream):
+                self._sleep_with_shutdown(stream.retry_seconds)
                 continue
 
-            ok, frame = self._read_frame()
+            ok, frame = self._read_frame(stream)
             if not ok or frame is None:
-                LOGGER.warning("Stream read failed, reconnect in %.1fs", self.retry_seconds)
-                self._close_capture()
-                self._clear_latest_frame()
-                self._sleep_with_shutdown(self.retry_seconds)
+                if self._rewind_local_video(stream):
+                    continue
+
+                LOGGER.warning("Stream read failed for %s, reconnect in %.1fs", stream.device_id, stream.retry_seconds)
+                self._close_capture(stream)
+                self._clear_latest_frame(stream)
+                self._sleep_with_shutdown(stream.retry_seconds)
                 continue
 
             # Keep only the most recent frame so inference stays close to real time.
-            self._store_latest_frame(frame.copy())
+            self._store_latest_frame(stream, frame.copy())
+            self._pace_local_video(stream)
+
+    def _rewind_local_video(self, stream: StreamRuntime) -> bool:
+        with stream.state_lock:
+            if stream.capture is None or not self._is_local_video_source(stream.rtmp_url):
+                return False
+
+            frame_count = stream.capture.get(cv2.CAP_PROP_FRAME_COUNT)
+            if frame_count <= 0:
+                return False
+
+            LOGGER.info("Local video source for %s reached the end, rewinding to the first frame", stream.device_id)
+            stream.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = stream.capture.read()
+            if not ok or frame is None:
+                self._close_capture(stream)
+                return False
+
+        self._store_latest_frame(stream, frame.copy())
+        self._pace_local_video(stream)
+        return True
+
+    def _capture_interval_for_source(self, stream: StreamRuntime) -> float:
+        if not self._is_local_video_source(stream.rtmp_url):
+            return 0.0
+
+        fps = 0.0
+        if stream.capture is not None:
+            fps = float(stream.capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps <= 0:
+            fps = float(stream.detect_fps)
+        return 1.0 / max(1.0, min(fps, 30.0))
+
+    def _pace_local_video(self, stream: StreamRuntime) -> None:
+        if stream.capture_interval > 0:
+            self._sleep_with_shutdown(stream.capture_interval)
+
+    def _is_local_video_source(self, source: str) -> bool:
+        normalized = source.strip().lower()
+        if normalized.startswith(("rtmp://", "rtsp://", "http://", "https://")):
+            return False
+        return Path(source).suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}
 
     def _inference_loop(self) -> None:
-        last_processed_seq = 0
         while not self.shutdown_event.is_set():
-            if not self.detect_enabled.wait(timeout=0.5):
+            active_streams = self._active_streams()
+            if not active_streams:
+                self._sleep_with_shutdown(0.2)
                 continue
 
-            with self.frame_ready:
-                while (
-                    not self.shutdown_event.is_set()
-                    and self.detect_enabled.is_set()
-                    and (self.latest_frame is None or self.latest_frame_seq == last_processed_seq)
-                ):
-                    self.frame_ready.wait(timeout=0.5)
-
-                if self.shutdown_event.is_set() or not self.detect_enabled.is_set():
+            did_work = False
+            for stream in active_streams:
+                if self.shutdown_event.is_set() or not stream.detect_enabled.is_set():
                     continue
 
-                frame = self.latest_frame.copy()
-                current_seq = self.latest_frame_seq
+                with stream.frame_ready:
+                    if stream.latest_frame is None or stream.latest_frame_seq == stream.last_processed_seq:
+                        continue
+                    frame = stream.latest_frame.copy()
+                    current_seq = stream.latest_frame_seq
 
-            now = time.time()
-            if now - self.last_result_at < self.detect_interval:
-                continue
+                now = time.time()
+                if now - stream.last_result_at < stream.detect_interval:
+                    continue
 
-            self.last_result_at = now
-            last_processed_seq = current_seq
-            try:
-                self._run_inference(frame)
-            except Exception:
-                LOGGER.exception("Inference loop failed, keeping supervisor alive")
-                self._sleep_with_shutdown(self.retry_seconds)
+                stream.last_result_at = now
+                stream.last_processed_seq = current_seq
+                did_work = True
+                try:
+                    self._run_inference(frame, stream)
+                except Exception:
+                    LOGGER.exception("Inference loop failed for %s, keeping supervisor alive", stream.device_id)
+                    self._sleep_with_shutdown(stream.retry_seconds)
 
-    def _run_inference(self, frame: Any) -> None:
+            if not did_work:
+                self._sleep_with_shutdown(0.05)
+
+    def _run_inference(self, frame: Any, stream: StreamRuntime) -> None:
         if self.model is None:
             raise RuntimeError("model is not loaded")
 
@@ -414,25 +548,25 @@ class DetectorSupervisor:
             )
 
         now = time.time()
-        detections = self._apply_temporal_filters(detections, now)
-        detections = self._filter_duplicate_detections(detections, now)
-        self.detect_count += 1
+        detections = self._apply_temporal_filters(stream, detections, now)
+        detections = self._filter_duplicate_detections(stream, detections, now)
+        stream.detect_count += 1
 
-        if not detections or not self.detect_enabled.is_set():
+        if not detections or not stream.detect_enabled.is_set():
             return
 
         annotated_frame = self._draw_detections(frame, detections)
         payload = {
-            "device_id": self.device_id,
+            "device_id": stream.device_id,
             "timestamp": int(time.time()),
             "detections": detections,
             "original_image": self._encode_frame(frame),
             "processed_image": self._encode_frame(annotated_frame),
         }
         self._post_detection(payload)
-        LOGGER.info("Posted %s detections (total runs=%s)", len(detections), self.detect_count)
+        LOGGER.info("Posted %s detections for %s (total runs=%s)", len(detections), stream.device_id, stream.detect_count)
 
-    def _apply_temporal_filters(self, detections: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    def _apply_temporal_filters(self, stream: StreamRuntime, detections: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
         if not detections:
             return []
 
@@ -440,18 +574,18 @@ class DetectorSupervisor:
         classes_seen = {str(detection.get("class", "unknown")) for detection in detections}
         for class_name in classes_seen:
             history = [
-                timestamp for timestamp in self.class_hit_history.get(class_name, [])
+                timestamp for timestamp in stream.class_hit_history.get(class_name, [])
                 if timestamp >= cutoff
             ]
             history.append(now)
-            self.class_hit_history[class_name] = history
+            stream.class_hit_history[class_name] = history
 
         filtered: list[dict[str, Any]] = []
         reported_this_frame: set[str] = set()
         for detection in detections:
             class_name = str(detection.get("class", "unknown"))
             required_hits = max(1, self.temporal_confirmations.get(class_name, 1))
-            hit_count = len(self.class_hit_history.get(class_name, []))
+            hit_count = len(stream.class_hit_history.get(class_name, []))
             if hit_count < required_hits:
                 LOGGER.debug(
                     "Suppressing %s until temporal confirmation reaches %s/%s",
@@ -461,7 +595,7 @@ class DetectorSupervisor:
                 )
                 continue
 
-            last_reported_at = self.last_reported_by_class.get(class_name, 0.0)
+            last_reported_at = stream.last_reported_by_class.get(class_name, 0.0)
             if now - last_reported_at < self.report_cooldown_seconds:
                 LOGGER.debug("Suppressing %s during %.1fs report cooldown", class_name, self.report_cooldown_seconds)
                 continue
@@ -471,18 +605,18 @@ class DetectorSupervisor:
 
             filtered.append(detection)
             reported_this_frame.add(class_name)
-            self.last_reported_by_class[class_name] = now
+            stream.last_reported_by_class[class_name] = now
 
         stale_classes = [
-            class_name for class_name, timestamps in self.class_hit_history.items()
+            class_name for class_name, timestamps in stream.class_hit_history.items()
             if not timestamps or all(timestamp < cutoff for timestamp in timestamps)
         ]
         for class_name in stale_classes:
-            self.class_hit_history.pop(class_name, None)
+            stream.class_hit_history.pop(class_name, None)
 
         return filtered
 
-    def _filter_duplicate_detections(self, detections: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    def _filter_duplicate_detections(self, stream: StreamRuntime, detections: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
         if not detections:
             return []
 
@@ -497,10 +631,10 @@ class DetectorSupervisor:
                 continue
 
             recent_items = [
-                item for item in self.recent_detections.get(class_name, [])
+                item for item in stream.recent_detections.get(class_name, [])
                 if float(item.get("timestamp", 0.0)) >= cutoff
             ]
-            self.recent_detections[class_name] = recent_items
+            stream.recent_detections[class_name] = recent_items
 
             is_duplicate = any(
                 self._is_same_detection(bbox, item.get("bbox", {}))
@@ -510,15 +644,15 @@ class DetectorSupervisor:
                 continue
 
             recent_items.append({"timestamp": now, "bbox": bbox})
-            self.recent_detections[class_name] = recent_items
+            stream.recent_detections[class_name] = recent_items
             filtered.append(detection)
 
         stale_classes = [
-            class_name for class_name, items in self.recent_detections.items()
+            class_name for class_name, items in stream.recent_detections.items()
             if not items or all(float(item.get("timestamp", 0.0)) < cutoff for item in items)
         ]
         for class_name in stale_classes:
-            self.recent_detections.pop(class_name, None)
+            stream.recent_detections.pop(class_name, None)
 
         return filtered
 
@@ -719,14 +853,18 @@ class DetectorSupervisor:
     def _sleep_with_shutdown(self, seconds: float) -> None:
         deadline = time.time() + seconds
         while time.time() < deadline and not self.shutdown_event.is_set():
-            time.sleep(0.2)
+            time.sleep(min(0.2, max(0.0, deadline - time.time())))
 
     def status_payload(self) -> dict[str, Any]:
+        streams = self._all_streams()
+        selected_stream = next((stream for stream in streams if stream.detect_enabled.is_set()), None)
+        if selected_stream is None:
+            selected_stream = streams[0] if streams else self._get_or_create_stream(self.device_id)
         return {
-            "device_id": self.device_id,
-            "running": self.detect_enabled.is_set(),
-            "rtmp_url": self.rtmp_url,
-            "detect_fps": self.detect_fps,
+            "device_id": selected_stream.device_id,
+            "running": any(stream.detect_enabled.is_set() for stream in streams),
+            "rtmp_url": selected_stream.rtmp_url,
+            "detect_fps": selected_stream.detect_fps,
             "infer_device": self.infer_device,
             "model_path": self.model_path,
             "secondary_model_path": self.secondary_model_path,
@@ -740,10 +878,21 @@ class DetectorSupervisor:
             "confirmation_window_seconds": self.confirmation_window_seconds,
             "report_cooldown_seconds": self.report_cooldown_seconds,
             "temporal_confirmations": self.temporal_confirmations,
-            "retry_seconds": self.retry_seconds,
-            "dedupe_window_seconds": self.dedupe_window_seconds,
-            "dedupe_iou_threshold": self.dedupe_iou_threshold,
-            "detect_count": self.detect_count,
+            "retry_seconds": selected_stream.retry_seconds,
+            "dedupe_window_seconds": selected_stream.dedupe_window_seconds,
+            "dedupe_iou_threshold": selected_stream.dedupe_iou_threshold,
+            "detect_count": sum(stream.detect_count for stream in streams),
+            "streams": {
+                stream.device_id: {
+                    "device_id": stream.device_id,
+                    "running": stream.detect_enabled.is_set(),
+                    "rtmp_url": stream.rtmp_url,
+                    "detect_fps": stream.detect_fps,
+                    "detect_count": stream.detect_count,
+                    "latest_frame_seq": stream.latest_frame_seq,
+                }
+                for stream in streams
+            },
         }
 
     def start_http_server(self) -> None:
@@ -783,7 +932,7 @@ class DetectorSupervisor:
                     supervisor.start_detection(payload)
                     self._write_json(HTTPStatus.OK, supervisor.status_payload())
                 elif self.path == "/stop":
-                    supervisor.stop_detection()
+                    supervisor.stop_detection(payload)
                     self._write_json(HTTPStatus.OK, supervisor.status_payload())
                 elif self.path == "/config":
                     supervisor.update_config(payload)
@@ -810,16 +959,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend-url", default=os.getenv("DETECTOR_BACKEND_URL", "http://127.0.0.1:8081/api/detections"))
     parser.add_argument("--model", default=os.getenv("DETECTOR_MODEL_PATH", "best.pt"))
     parser.add_argument("--secondary-model", default=os.getenv("DETECTOR_SECONDARY_MODEL_PATH", "fire_smoke_best.pt"))
-    parser.add_argument("--fight-model", default=os.getenv("DETECTOR_FIGHT_MODEL_PATH", "fight_best.pt"))
+    parser.add_argument("--fight-model", default=os.getenv("DETECTOR_FIGHT_MODEL_PATH", "fight_siwon_yolo_best.pt"))
     parser.add_argument("--primary-classes", default=os.getenv("DETECTOR_PRIMARY_CLASSES", "knife"))
     parser.add_argument("--secondary-classes", default=os.getenv("DETECTOR_SECONDARY_CLASSES", "fire,smoke"))
     parser.add_argument("--fight-classes", default=os.getenv("DETECTOR_FIGHT_CLASSES", "fight"))
     parser.add_argument("--primary-min-confidence", type=float, default=float(os.getenv("DETECTOR_PRIMARY_MIN_CONFIDENCE", "0.35")))
-    parser.add_argument("--secondary-min-confidence", type=float, default=float(os.getenv("DETECTOR_SECONDARY_MIN_CONFIDENCE", "0.65")))
-    parser.add_argument("--fight-min-confidence", type=float, default=float(os.getenv("DETECTOR_FIGHT_MIN_CONFIDENCE", "0.65")))
-    parser.add_argument("--confirmation-window-seconds", type=float, default=float(os.getenv("DETECTOR_CONFIRMATION_WINDOW_SECONDS", "2.5")))
-    parser.add_argument("--report-cooldown-seconds", type=float, default=float(os.getenv("DETECTOR_REPORT_COOLDOWN_SECONDS", "20")))
-    parser.add_argument("--temporal-confirmations", default=os.getenv("DETECTOR_TEMPORAL_CONFIRMATIONS", "fire:2,smoke:2,fight:2,knife:1"))
+    parser.add_argument("--secondary-min-confidence", type=float, default=float(os.getenv("DETECTOR_SECONDARY_MIN_CONFIDENCE", "0.55")))
+    parser.add_argument("--fight-min-confidence", type=float, default=float(os.getenv("DETECTOR_FIGHT_MIN_CONFIDENCE", "0.45")))
+    parser.add_argument("--confirmation-window-seconds", type=float, default=float(os.getenv("DETECTOR_CONFIRMATION_WINDOW_SECONDS", "3.0")))
+    parser.add_argument("--report-cooldown-seconds", type=float, default=float(os.getenv("DETECTOR_REPORT_COOLDOWN_SECONDS", "12")))
+    parser.add_argument("--temporal-confirmations", default=os.getenv("DETECTOR_TEMPORAL_CONFIRMATIONS", "fire:2,smoke:2,fight:1,knife:1"))
     parser.add_argument("--fps", type=int, default=int(os.getenv("DETECTOR_FPS", "5")))
     parser.add_argument("--device", default=os.getenv("DETECTOR_DEVICE_ID", "windows-edge-001"))
     parser.add_argument("--infer-device", default=os.getenv("DETECTOR_INFER_DEVICE", "auto"))

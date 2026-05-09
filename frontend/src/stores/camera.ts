@@ -7,8 +7,80 @@ import type { Camera } from '@/types/domain'
 
 const defaultDraft = (): Camera => ({ name: '', deviceId: '', ipAddress: '', port: 1935, location: '', status: 'OFFLINE', streamUrl: '' })
 const TEST_CAMERA_PATTERNS = [/test/i, /demo/i, /edge-camera-01/i, /camera1/i, /stream/i]
+const FIRE_DEMO_MP4_DISPLAY_URL = import.meta.env.VITE_FIRE_DEMO_MP4_DISPLAY_URL || '/demo-videos/0_Wildfire_Field_Fire_3840x2160.mp4'
+const FIRE_DEMO_MP4_DETECTOR_SOURCE = import.meta.env.VITE_FIRE_DEMO_MP4_DETECTOR_SOURCE || 'D:/codex_project/Iot_securit_system/video/0_Wildfire_Field_Fire_3840x2160.mp4'
+const FIGHT_DEMO_MP4_DISPLAY_URL = import.meta.env.VITE_FIGHT_DEMO_MP4_DISPLAY_URL || '/demo-videos/fight_demo_sample_2.mp4'
+const FIGHT_DEMO_MP4_DETECTOR_SOURCE = import.meta.env.VITE_FIGHT_DEMO_MP4_DETECTOR_SOURCE || 'D:/codex_project/Iot_securit_system/video/fight_demo_sample_2.mp4'
+const FLV_BASE_URL = import.meta.env.VITE_FLV_BASE_URL || 'http://127.0.0.1:8080/live'
+const EDGE_RTMP_DETECTOR_SOURCE = import.meta.env.VITE_EDGE_RTMP_DETECTOR_SOURCE || 'rtmp://127.0.0.1:1935/myapp/stream'
+
+const demoSourceOverrides: Record<string, Partial<Camera> & { detectorSource?: string }> = {
+  'legacy-camera-1': {
+    name: 'Camera 1 - Laptop Webcam',
+    location: 'Local Browser Camera',
+    status: 'ONLINE',
+    streamUrl: 'webcam://local',
+    detectorSource: '0',
+  },
+  'legacy-camera-2': {
+    name: 'Camera 2 - MP4 Demo Feed',
+    location: 'Prepared Demo Video',
+    status: 'ONLINE',
+    streamUrl: FIRE_DEMO_MP4_DISPLAY_URL,
+    detectorSource: FIRE_DEMO_MP4_DETECTOR_SOURCE,
+  },
+  'legacy-camera-3': {
+    name: 'Camera 3 - Fight MP4 Demo',
+    location: 'Prepared Fight Demo Video',
+    status: 'ONLINE',
+    streamUrl: FIGHT_DEMO_MP4_DISPLAY_URL,
+    detectorSource: FIGHT_DEMO_MP4_DETECTOR_SOURCE,
+  },
+  'edge-camera-02': {
+    name: 'Camera 2 - Laptop Webcam',
+    location: 'Local Browser Camera',
+    status: 'ONLINE',
+    streamUrl: 'webcam://local',
+    detectorSource: '0',
+  },
+  'edge-camera-03': {
+    name: 'Camera 3 - MP4 Demo Feed',
+    location: 'Prepared Demo Video',
+    status: 'ONLINE',
+    streamUrl: FIRE_DEMO_MP4_DISPLAY_URL,
+    detectorSource: FIRE_DEMO_MP4_DETECTOR_SOURCE,
+  },
+}
+
+const detectorSourceOverrides: Record<string, string> = {
+  'legacy-camera-1': '0',
+  'legacy-camera-2': FIRE_DEMO_MP4_DETECTOR_SOURCE,
+  'legacy-camera-3': FIGHT_DEMO_MP4_DETECTOR_SOURCE,
+  'edge-camera-01': EDGE_RTMP_DETECTOR_SOURCE,
+  'edge-camera-02': '0',
+  'edge-camera-03': FIRE_DEMO_MP4_DETECTOR_SOURCE,
+}
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+const isDemoPlaybackSource = (source?: string) => Boolean(source?.startsWith('webcam://') || source?.includes('.mp4'))
+
+const convertRtmpToHttpFlv = (source?: string) => {
+  if (!source?.startsWith('rtmp://')) return source ?? ''
+
+  try {
+    const rtmpUrl = new URL(source)
+    const parts = rtmpUrl.pathname.split('/').filter(Boolean)
+    const app = parts[0] || 'myapp'
+    const stream = parts.slice(1).join('/') || 'stream'
+    const flvUrl = new URL(FLV_BASE_URL)
+    flvUrl.searchParams.set('app', app)
+    flvUrl.searchParams.set('stream', stream)
+    return flvUrl.toString()
+  } catch {
+    return source
+  }
+}
 
 const getCameraScore = (camera: Camera) => {
   const haystack = [camera.name, camera.deviceId, camera.location, camera.streamUrl].filter(Boolean).join(' ')
@@ -24,16 +96,39 @@ const normalizeStatus = (isTestCamera: boolean, streamReady: boolean) => {
 export const useCameraStore = defineStore('camera', () => {
   const rawCameras = ref<Camera[]>([])
   const selectedCameraId = ref<number | null>(null)
-  const selectedStreamBaseUrl = ref('')
-  const selectedStreamToken = ref(0)
-  const streamPlaybackEnabled = ref(false)
   const loading = ref(false)
   const draft = ref<Camera>(defaultDraft())
   const streamStates = ref<Record<string, boolean>>({})
+  const streamBaseUrls = ref<Record<string, string>>({})
+  const streamTokens = ref<Record<string, number>>({})
+  const playerConnectedStates = ref<Record<string, boolean>>({})
   const detectorStates = ref<Record<string, boolean>>({})
   const streamPending = ref(false)
   const detectorPending = ref(false)
-  const playerConnected = ref(false)
+
+  const applyDemoSource = (camera: Camera): Camera => {
+    const override = camera.deviceId ? demoSourceOverrides[camera.deviceId] : null
+    return override ? { ...camera, ...override } : camera
+  }
+
+  const resolveDisplayStreamUrl = async (camera: Camera) => {
+    const demoCamera = applyDemoSource(camera)
+    if (demoCamera.deviceId && demoSourceOverrides[demoCamera.deviceId]) return demoCamera.streamUrl ?? ''
+    try {
+      return convertRtmpToHttpFlv(await cameraApi.stream(camera.id!))
+    } catch {
+      return convertRtmpToHttpFlv(demoCamera.streamUrl)
+    }
+  }
+
+  const selectedDetectorSource = computed(() => {
+    const camera = selectedCamera.value
+    if (!camera?.deviceId) return ''
+    const override = detectorSourceOverrides[camera.deviceId] ?? demoSourceOverrides[camera.deviceId]?.detectorSource
+    if (override) return override
+    if (camera.streamUrl?.startsWith('webcam://')) return '0'
+    return camera.streamUrl || 'rtmp://127.0.0.1/myapp/stream'
+  })
 
   const testCameraId = computed<number | null>(() => {
     if (!rawCameras.value.length) return null
@@ -41,27 +136,42 @@ export const useCameraStore = defineStore('camera', () => {
     return sorted[0]?.id ?? rawCameras.value[0]?.id ?? null
   })
 
-  const streamCommandIssued = computed(() => {
-    const testCamera = rawCameras.value.find((camera) => camera.id === testCameraId.value)
-    const deviceId = testCamera?.deviceId?.trim() ?? ''
-    return deviceId ? Boolean(streamStates.value[deviceId]) : false
-  })
-
   const cameras = computed<Camera[]>(() =>
-    rawCameras.value.map((camera) => ({
-      ...camera,
-      status: normalizeStatus(camera.id === testCameraId.value, playerConnected.value),
-    })),
+    rawCameras.value.map((camera) => {
+      const demoCamera = applyDemoSource(camera)
+      return {
+        ...demoCamera,
+        status: demoCamera.deviceId && demoSourceOverrides[demoCamera.deviceId]
+          ? demoCamera.status
+          : normalizeStatus(camera.id === testCameraId.value, Boolean(playerConnectedStates.value[demoCamera.deviceId ?? ''])),
+      }
+    }),
   )
 
   const selectedCamera = computed(() => cameras.value.find((camera) => camera.id === selectedCameraId.value) ?? null)
   const selectedDeviceId = computed(() => selectedCamera.value?.deviceId?.trim() ?? '')
+  const selectedStreamCommandIssued = computed(() => {
+    const deviceId = selectedDeviceId.value
+    return deviceId ? Boolean(streamStates.value[deviceId]) : false
+  })
+  const selectedStreamBaseUrl = computed(() => {
+    const deviceId = selectedDeviceId.value
+    return deviceId ? streamBaseUrls.value[deviceId] ?? '' : ''
+  })
+  const selectedStreamToken = computed(() => {
+    const deviceId = selectedDeviceId.value
+    return deviceId ? streamTokens.value[deviceId] ?? 0 : 0
+  })
+  const selectedPlayerConnected = computed(() => {
+    const deviceId = selectedDeviceId.value
+    return deviceId ? Boolean(playerConnectedStates.value[deviceId]) : false
+  })
   const selectedStreamUrl = computed(() => {
-    if (!streamPlaybackEnabled.value || !selectedStreamBaseUrl.value) return ''
+    if (!selectedStreamCommandIssued.value || !selectedStreamBaseUrl.value) return ''
     const separator = selectedStreamBaseUrl.value.includes('?') ? '&' : '?'
     return `${selectedStreamBaseUrl.value}${separator}ts=${selectedStreamToken.value}`
   })
-  const selectedStreamRunning = computed(() => playerConnected.value || streamCommandIssued.value)
+  const selectedStreamRunning = computed(() => selectedPlayerConnected.value || selectedStreamCommandIssued.value)
   const selectedDetectionRunning = computed(() => {
     const deviceId = selectedDeviceId.value
     return deviceId ? Boolean(detectorStates.value[deviceId]) : false
@@ -69,23 +179,20 @@ export const useCameraStore = defineStore('camera', () => {
   const monitorLockedToTestCamera = computed(() => Boolean(testCameraId.value && selectedCameraId.value === testCameraId.value))
 
   const applyCameraSelection = async (preferredId?: number | null) => {
-    const targetId = testCameraId.value ?? preferredId ?? rawCameras.value[0]?.id ?? null
+    const targetId = preferredId ?? testCameraId.value ?? rawCameras.value[0]?.id ?? null
     selectedCameraId.value = targetId
-    if (!targetId) {
-      selectedStreamBaseUrl.value = ''
-      return
-    }
+    if (!targetId) return
 
-    try {
-      selectedStreamBaseUrl.value = await cameraApi.stream(targetId)
-    } catch {
-      const fallback = rawCameras.value.find((camera) => camera.id === targetId)
-      selectedStreamBaseUrl.value = fallback?.streamUrl ?? ''
-    }
+    const fallback = rawCameras.value.find((camera) => camera.id === targetId)
+    if (!fallback?.deviceId) return
+    const deviceId = fallback.deviceId.trim()
+    streamBaseUrls.value = { ...streamBaseUrls.value, [deviceId]: await resolveDisplayStreamUrl(fallback) }
   }
 
-  const refreshStreamSession = () => {
-    selectedStreamToken.value += 1
+  const refreshStreamSession = (targetDeviceId?: string) => {
+    const deviceId = targetDeviceId ?? selectedDeviceId.value
+    if (!deviceId) return
+    streamTokens.value = { ...streamTokens.value, [deviceId]: (streamTokens.value[deviceId] ?? 0) + 1 }
   }
 
   const loadCameras = async () => {
@@ -99,8 +206,6 @@ export const useCameraStore = defineStore('camera', () => {
   }
 
   const selectCamera = async (id: number) => {
-    if (testCameraId.value && id !== testCameraId.value) return
-    playerConnected.value = false
     await applyCameraSelection(id)
     refreshStreamSession()
   }
@@ -109,7 +214,6 @@ export const useCameraStore = defineStore('camera', () => {
     const updated = await cameraApi.refresh(id)
     rawCameras.value = rawCameras.value.map((camera) => (camera.id === id ? updated : camera))
     if (selectedCameraId.value === id) {
-      playerConnected.value = false
       await applyCameraSelection(id)
       refreshStreamSession()
     }
@@ -139,17 +243,16 @@ export const useCameraStore = defineStore('camera', () => {
     await cameraApi.remove(id)
     rawCameras.value = rawCameras.value.filter((camera) => camera.id !== id)
     if (selectedCameraId.value === id) {
-      playerConnected.value = false
       await applyCameraSelection(null)
       refreshStreamSession()
     }
     uiStore.pushToast('Deleted successfully.', 'success')
   }
 
-  const softReloadStream = async (attempts = 6, intervalMs = 1200) => {
+  const softReloadStream = async (targetDeviceId = selectedDeviceId.value, attempts = 6, intervalMs = 1200) => {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (playerConnected.value) break
-      refreshStreamSession()
+      if (targetDeviceId && playerConnectedStates.value[targetDeviceId]) break
+      refreshStreamSession(targetDeviceId)
       if (attempt < attempts - 1) await wait(intervalMs)
     }
   }
@@ -158,14 +261,19 @@ export const useCameraStore = defineStore('camera', () => {
     const uiStore = useUiStore()
     if (!selectedDeviceId.value || streamPending.value) return
 
+    const deviceId = selectedDeviceId.value
+    const camera = selectedCamera.value
     streamPending.value = true
     try {
-      playerConnected.value = false
-      await edgeApi.startStream(selectedDeviceId.value)
-      streamStates.value = { ...streamStates.value, [selectedDeviceId.value]: true }
-      streamPlaybackEnabled.value = true
-      await applyCameraSelection(selectedCameraId.value)
-      void softReloadStream()
+      playerConnectedStates.value = { ...playerConnectedStates.value, [deviceId]: false }
+      const demoSource = isDemoPlaybackSource(camera?.streamUrl)
+      if (!demoSource) {
+        await edgeApi.startStream(deviceId)
+      }
+      streamStates.value = { ...streamStates.value, [deviceId]: true }
+      await applyCameraSelection(camera?.id ?? selectedCameraId.value)
+      refreshStreamSession(deviceId)
+      void softReloadStream(deviceId)
       uiStore.pushToast('Stream started.', 'success')
     } finally {
       streamPending.value = false
@@ -177,19 +285,22 @@ export const useCameraStore = defineStore('camera', () => {
     if (!selectedDeviceId.value || streamPending.value) return
 
     streamPending.value = true
-    const previousBaseUrl = selectedStreamBaseUrl.value
+    const deviceId = selectedDeviceId.value
+    const camera = selectedCamera.value
+    const previousBaseUrl = streamBaseUrls.value[deviceId] ?? ''
     try {
-      streamStates.value = { ...streamStates.value, [selectedDeviceId.value]: false }
-      streamPlaybackEnabled.value = false
-      playerConnected.value = false
-      selectedStreamBaseUrl.value = ''
-      refreshStreamSession()
-      await edgeApi.stopStream(selectedDeviceId.value)
+      streamStates.value = { ...streamStates.value, [deviceId]: false }
+      playerConnectedStates.value = { ...playerConnectedStates.value, [deviceId]: false }
+      streamBaseUrls.value = { ...streamBaseUrls.value, [deviceId]: '' }
+      refreshStreamSession(deviceId)
+      const demoSource = isDemoPlaybackSource(camera?.streamUrl)
+      if (!demoSource) {
+        await edgeApi.stopStream(deviceId)
+      }
       uiStore.pushToast('Stream stopped.', 'success')
     } catch (error) {
-      streamStates.value = { ...streamStates.value, [selectedDeviceId.value]: true }
-      streamPlaybackEnabled.value = true
-      selectedStreamBaseUrl.value = previousBaseUrl
+      streamStates.value = { ...streamStates.value, [deviceId]: true }
+      streamBaseUrls.value = { ...streamBaseUrls.value, [deviceId]: previousBaseUrl }
       throw error
     } finally {
       streamPending.value = false
@@ -200,10 +311,22 @@ export const useCameraStore = defineStore('camera', () => {
     const uiStore = useUiStore()
     if (!selectedDeviceId.value || detectorPending.value) return
 
+    const deviceId = selectedDeviceId.value
+    const detectorSource = selectedDetectorSource.value
     detectorPending.value = true
     try {
-      await edgeApi.startDetector(selectedDeviceId.value)
-      detectorStates.value = { ...detectorStates.value, [selectedDeviceId.value]: true }
+      const detectorConfig = detectorSource ? JSON.stringify({
+        device_id: deviceId,
+        rtmp_url: detectorSource,
+        detect_fps: 5,
+      }) : undefined
+      if (detectorSource) {
+        const configResponse = await edgeApi.detectorConfig(deviceId, detectorConfig!)
+        if (!configResponse.success) throw new Error(configResponse.message || 'Detector config failed.')
+      }
+      const startResponse = await edgeApi.startDetector(deviceId, detectorConfig)
+      if (!startResponse.success) throw new Error(startResponse.message || 'Detector start failed.')
+      detectorStates.value = { ...detectorStates.value, [deviceId]: true }
       uiStore.pushToast('Detection started.', 'success')
     } finally {
       detectorPending.value = false
@@ -214,10 +337,12 @@ export const useCameraStore = defineStore('camera', () => {
     const uiStore = useUiStore()
     if (!selectedDeviceId.value || detectorPending.value) return
 
+    const deviceId = selectedDeviceId.value
     detectorPending.value = true
     try {
-      await edgeApi.stopDetector(selectedDeviceId.value)
-      detectorStates.value = { ...detectorStates.value, [selectedDeviceId.value]: false }
+      const stopResponse = await edgeApi.stopDetector(deviceId)
+      if (!stopResponse.success) throw new Error(stopResponse.message || 'Detector stop failed.')
+      detectorStates.value = { ...detectorStates.value, [deviceId]: false }
       uiStore.pushToast('Detection stopped.', 'success')
     } finally {
       detectorPending.value = false
@@ -271,7 +396,9 @@ export const useCameraStore = defineStore('camera', () => {
   }
 
   const setStreamPresence = (connected: boolean) => {
-    playerConnected.value = connected
+    const deviceId = selectedDeviceId.value
+    if (!deviceId) return
+    playerConnectedStates.value = { ...playerConnectedStates.value, [deviceId]: connected }
   }
 
   return {

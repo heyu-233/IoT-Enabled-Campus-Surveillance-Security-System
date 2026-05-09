@@ -36,8 +36,8 @@ public class EdgeController {
     }
 
     @PostMapping("/host/detector/start")
-    public ResponseEntity<EdgeCommandResponse> startDetector(@RequestParam String deviceId) {
-        return ResponseEntity.ok(detectorSupervisorClient.start(deviceId));
+    public ResponseEntity<EdgeCommandResponse> startDetector(@RequestParam String deviceId, @RequestBody(required = false) String config) {
+        return ResponseEntity.ok(detectorSupervisorClient.start(deviceId, config));
     }
 
     @PostMapping("/host/detector/stop")
@@ -72,7 +72,7 @@ public class EdgeController {
 
     @PostMapping("/edge/control/start")
     public ResponseEntity<EdgeCommandResponse> legacyStartDetection(@RequestParam String deviceId) {
-        return startDetector(deviceId);
+        return startDetector(deviceId, null);
     }
 
     @PostMapping("/edge/control/stop")
