@@ -129,8 +129,8 @@ function Start-ManagedProcess {
   $stdout = Join-Path $logDir "$Name.out.log"
   $stderr = Join-Path $logDir "$Name.err.log"
   $pidFile = Join-Path $pidDir $PidFileName
-  Set-Content -Path $stdout -Value ''
-  Set-Content -Path $stderr -Value ''
+  $stdout = Initialize-LogFile -Path $stdout -Name $Name -StreamName 'stdout'
+  $stderr = Initialize-LogFile -Path $stderr -Name $Name -StreamName 'stderr'
 
   Write-Step "Starting $Name..."
   $process = Start-Process -FilePath $FilePath `
@@ -143,6 +143,75 @@ function Start-ManagedProcess {
 
   Set-Content -Path $pidFile -Value $process.Id
   Write-Step "$Name started with PID $($process.Id). Logs: $stdout"
+}
+
+function Initialize-LogFile {
+  param(
+    [string]$Path,
+    [string]$Name,
+    [string]$StreamName
+  )
+
+  try {
+    Set-Content -Path $Path -Value '' -ErrorAction Stop
+    return $Path
+  } catch {
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $directory = Split-Path -Parent $Path
+    $fileName = Split-Path -Leaf $Path
+    $fallbackPath = Join-Path $directory "$timestamp.$fileName"
+    Write-Step "$Name $StreamName log is locked, using $fallbackPath instead."
+    Set-Content -Path $fallbackPath -Value ''
+    return $fallbackPath
+  }
+}
+
+function Stop-ProcessTree {
+  param(
+    [int]$ProcessId,
+    [string]$Name
+  )
+
+  $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $idsToStop = New-Object System.Collections.Generic.List[int]
+
+  function Add-ChildProcessIds {
+    param([int]$ParentId)
+
+    foreach ($child in $allProcesses | Where-Object { $_.ParentProcessId -eq $ParentId }) {
+      Add-ChildProcessIds -ParentId ([int]$child.ProcessId)
+      $idsToStop.Add([int]$child.ProcessId)
+    }
+  }
+
+  Add-ChildProcessIds -ParentId $ProcessId
+  $idsToStop.Add($ProcessId)
+
+  foreach ($id in ($idsToStop | Select-Object -Unique)) {
+    try {
+      Stop-Process -Id $id -Force -ErrorAction Stop
+      Write-Step "$Name stopped process PID $id."
+    } catch {
+      Write-Step "$Name process PID $id was already stopped or could not be stopped."
+    }
+  }
+}
+
+function Stop-OrphanedProjectProcesses {
+  param(
+    [string]$Name,
+    [string[]]$Patterns
+  )
+
+  $currentPid = $PID
+  $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $commandLine = [string]$_.CommandLine
+    $_.ProcessId -ne $currentPid -and ($Patterns | Where-Object { $commandLine -match $_ })
+  })
+
+  foreach ($process in $processes) {
+    Stop-ProcessTree -ProcessId ([int]$process.ProcessId) -Name "$Name stale process"
+  }
 }
 
 function Stop-LocalNginx {
@@ -238,9 +307,15 @@ if ($EnableNginx) {
   Start-LocalNginx
 }
 
+$escapedRoot = [regex]::Escape($root)
+
 if (Test-PortOpen -Port $BackendPort) {
   Write-Step "Backend already appears to be running on port $BackendPort."
 } else {
+  Stop-OrphanedProjectProcesses -Name 'backend' -Patterns @(
+    "$escapedRoot.*end_part.*spring-boot:run",
+    "$escapedRoot.*end_part.*EndPartApplication"
+  )
   Start-ManagedProcess `
     -Name 'backend' `
     -FilePath $backendMvnw `
@@ -252,6 +327,9 @@ if (Test-PortOpen -Port $BackendPort) {
 if (Test-PortOpen -Port $FrontendPort) {
   Write-Step "Frontend already appears to be running on port $FrontendPort."
 } else {
+  Stop-OrphanedProjectProcesses -Name 'frontend' -Patterns @(
+    "$escapedRoot.*frontend.*vite"
+  )
   Start-ManagedProcess `
     -Name 'frontend' `
     -FilePath $frontendVite `
@@ -276,6 +354,9 @@ if (Test-Path $detectorPidFile) {
 }
 
 if (-not $detectorRunning) {
+  Stop-OrphanedProjectProcesses -Name 'detector-supervisor' -Patterns @(
+    "$escapedRoot.*video_stream.*yolo_inference_windows.py"
+  )
   $detectorPython = Get-DetectorPython
   Start-ManagedProcess `
     -Name 'detector-supervisor' `

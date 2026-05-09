@@ -15,13 +15,20 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class DetectionService {
@@ -57,6 +64,12 @@ public class DetectionService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    private final ExecutorService persistenceExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "detection-persistence");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     public void processDetection(String payload) {
         try {
             @SuppressWarnings("unchecked")
@@ -72,74 +85,147 @@ public class DetectionService {
                 return;
             }
 
-            markCameraOnline(camera);
-            SavedImages savedImages = saveImages(data, "detection");
-
-            if (detections == null || detections.isEmpty()) {
+            List<DetectionCandidate> candidates = collectDetectionCandidates(detections);
+            if (candidates.isEmpty()) {
                 logger.info("Detection payload for device {} contained no detections", deviceId);
+                persistDetectionAsync(camera, timestamp, data, candidates, Set.of());
                 return;
             }
 
-            for (Map<String, Object> detection : detections) {
-                Object confidenceValue = detection.get("confidence");
-                if (!(confidenceValue instanceof Number confidenceNumber)) {
-                    logger.warn("Skipping malformed detection without confidence: {}", detection);
-                    continue;
-                }
-
-                String className = String.valueOf(detection.getOrDefault("class", "unknown"));
-                Double confidence = confidenceNumber.doubleValue();
-
-                Behavior behavior = new Behavior();
-                behavior.setCameraId(camera.getId());
-                behavior.setType(className);
-                behavior.setDescription("Detected: " + className);
-                behavior.setImageUrl(savedImages.processedImageUrl());
-                behavior.setProcessedImageUrl(savedImages.processedImageUrl());
-                behavior.setOriginalImageUrl(savedImages.originalImageUrl());
-                behavior.setConfidence(confidence);
-                behavior.setOccurredAt(toOccurredAt(timestamp));
-
-                behaviorService.addBehavior(behavior);
-
-                if (confidence >= alertThreshold) {
-                    createAlertFromBehavior(behavior, className, confidence);
-                }
+            Set<String> alertKeysToCreate = reserveImmediateAlerts(camera, candidates);
+            if (!alertKeysToCreate.isEmpty()) {
+                publishBuzzerSignal();
             }
+
+            persistDetectionAsync(camera, timestamp, data, candidates, alertKeysToCreate);
         } catch (Exception e) {
             logger.error("Failed to handle detection result payload", e);
         }
     }
 
-    private void createAlertFromBehavior(Behavior behavior, String className, Double confidence) {
-        String dedupKey = behavior.getCameraId() + ":" + className;
-        long nowEpoch = System.currentTimeMillis() / 1000;
-        Long lastTime = recentAlertCache.get(dedupKey);
-        boolean isDuplicate = lastTime != null && (nowEpoch - lastTime) < alertDedupWindowSeconds;
-
-        if (!isDuplicate) {
-            recentAlertCache.put(dedupKey, nowEpoch);
-
-            Alert alert = new Alert();
-            alert.setBehaviorId(behavior.getId());
-            alert.setType(className);
-            if (confidence >= 0.95) {
-                alert.setSeverity("HIGH");
-            } else if (confidence >= 0.85) {
-                alert.setSeverity("MEDIUM");
-            } else {
-                alert.setSeverity("LOW");
+    @PreDestroy
+    public void shutdown() {
+        persistenceExecutor.shutdown();
+        try {
+            if (!persistenceExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                persistenceExecutor.shutdownNow();
             }
-            alert.setStatus("UNPROCESSED");
-            alert.setDescription("Auto alert: detected " + className + " with confidence " + String.format("%.2f", confidence));
-            alert.setCreatedAt(LocalDateTime.now());
-            alertMapper.insert(alert);
-        } else {
-            logger.debug("Suppressed duplicate alert record for camera {} class {} ({}s since last)",
-                behavior.getCameraId(), className, nowEpoch - lastTime);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            persistenceExecutor.shutdownNow();
+        }
+    }
+
+    private List<DetectionCandidate> collectDetectionCandidates(List<Map<String, Object>> detections) {
+        List<DetectionCandidate> candidates = new ArrayList<>();
+        if (detections == null) {
+            return candidates;
         }
 
-        publishBuzzerSignal();
+        for (Map<String, Object> detection : detections) {
+            Object confidenceValue = detection.get("confidence");
+            if (!(confidenceValue instanceof Number confidenceNumber)) {
+                logger.warn("Skipping malformed detection without confidence: {}", detection);
+                continue;
+            }
+
+            String className = String.valueOf(detection.getOrDefault("class", "unknown"));
+            candidates.add(new DetectionCandidate(className, confidenceNumber.doubleValue()));
+        }
+        return candidates;
+    }
+
+    private void persistDetectionAsync(
+            Camera camera,
+            Long timestamp,
+            Map<String, Object> data,
+            List<DetectionCandidate> candidates,
+            Set<String> alertKeysToCreate
+    ) {
+        persistenceExecutor.submit(() -> {
+            try {
+                persistDetection(camera, timestamp, data, candidates, alertKeysToCreate);
+            } catch (Exception e) {
+                logger.error("Failed to persist detection result asynchronously", e);
+            }
+        });
+    }
+
+    private void persistDetection(
+            Camera camera,
+            Long timestamp,
+            Map<String, Object> data,
+            List<DetectionCandidate> candidates,
+            Set<String> alertKeysToCreate
+    ) {
+        markCameraOnline(camera);
+        SavedImages savedImages = saveImages(data, "detection");
+        Set<String> createdAlertKeys = new HashSet<>();
+
+        for (DetectionCandidate candidate : candidates) {
+            Behavior behavior = new Behavior();
+            behavior.setCameraId(camera.getId());
+            behavior.setType(candidate.className());
+            behavior.setDescription("Detected: " + candidate.className());
+            behavior.setImageUrl(savedImages.processedImageUrl());
+            behavior.setProcessedImageUrl(savedImages.processedImageUrl());
+            behavior.setOriginalImageUrl(savedImages.originalImageUrl());
+            behavior.setConfidence(candidate.confidence());
+            behavior.setOccurredAt(toOccurredAt(timestamp));
+
+            behaviorService.addBehavior(behavior);
+
+            String alertKey = alertKey(behavior.getCameraId(), candidate.className());
+            if (alertKeysToCreate.contains(alertKey) && createdAlertKeys.add(alertKey)) {
+                createAlertFromBehavior(behavior, candidate.className(), candidate.confidence());
+            }
+        }
+    }
+
+    private void createAlertFromBehavior(Behavior behavior, String className, Double confidence) {
+        Alert alert = new Alert();
+        alert.setBehaviorId(behavior.getId());
+        alert.setType(className);
+        if (confidence >= 0.95) {
+            alert.setSeverity("HIGH");
+        } else if (confidence >= 0.85) {
+            alert.setSeverity("MEDIUM");
+        } else {
+            alert.setSeverity("LOW");
+        }
+        alert.setStatus("UNPROCESSED");
+        alert.setDescription("Auto alert: detected " + className + " with confidence " + String.format("%.2f", confidence));
+        alert.setCreatedAt(LocalDateTime.now());
+        alertMapper.insert(alert);
+    }
+
+    private Set<String> reserveImmediateAlerts(Camera camera, List<DetectionCandidate> candidates) {
+        Set<String> alertKeys = new HashSet<>();
+        for (DetectionCandidate candidate : candidates) {
+            if (candidate.confidence() < alertThreshold) {
+                continue;
+            }
+
+            String alertKey = alertKey(camera.getId(), candidate.className());
+            if (reserveAlertKey(alertKey)) {
+                alertKeys.add(alertKey);
+            }
+        }
+        return alertKeys;
+    }
+
+    private synchronized boolean reserveAlertKey(String alertKey) {
+        long nowEpoch = System.currentTimeMillis() / 1000;
+        Long previous = recentAlertCache.put(alertKey, nowEpoch);
+        boolean duplicate = previous != null && (nowEpoch - previous) < alertDedupWindowSeconds;
+        if (duplicate) {
+            recentAlertCache.put(alertKey, previous);
+        }
+        return !duplicate;
+    }
+
+    private String alertKey(Long cameraId, String className) {
+        return cameraId + ":" + className;
     }
 
     private Camera resolveCamera(String deviceId) {
@@ -216,5 +302,8 @@ public class DetectionService {
     }
 
     private record SavedImages(String originalImageUrl, String processedImageUrl) {
+    }
+
+    private record DetectionCandidate(String className, Double confidence) {
     }
 }

@@ -4,7 +4,7 @@ MQTT_HOST="192.168.1.10"
 MQTT_PORT="1883"
 
 STREAM_PROC="v4l2_rtmp_push"
-STREAM_CMD="/root/v4l2_rtmp_push /dev/video0 rtmp://192.168.1.10:1935/myapp/stream 320 240 15 0"
+STREAM_CMD="LD_LIBRARY_PATH=/root:\$LD_LIBRARY_PATH /root/v4l2_rtmp_push /dev/video0 rtmp://192.168.1.10:1935/myapp/stream 480 272 15 0"
 
 LOCK_FILE="/tmp/edge_agent.lock"
 HEARTBEAT_INTERVAL=5

@@ -14,6 +14,9 @@ $nginxServiceName = 'nginx'
 $nginxRoot = Join-Path $root 'nginx-1.19.3'
 $nginxExe = Join-Path $nginxRoot 'nginx.exe'
 $nginxConf = Join-Path $nginxRoot 'conf\nginx.conf'
+$backendPort = 8081
+$frontendPort = 5173
+$detectorPort = 19090
 
 function Write-Step {
   param([string]$Message)
@@ -82,11 +85,84 @@ function Stop-ManagedProcess {
     return
   }
 
-  try {
-    Stop-Process -Id $process.Id -Force -ErrorAction Stop
-    Write-Step "$Name stopped (PID $($process.Id))."
-  } finally {
-    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTree -ProcessId $process.Id -Name $Name
+  Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-ProcessTree {
+  param(
+    [int]$ProcessId,
+    [string]$Name
+  )
+
+  $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $idsToStop = New-Object System.Collections.Generic.List[int]
+
+  function Add-ChildProcessIds {
+    param([int]$ParentId)
+
+    foreach ($child in $allProcesses | Where-Object { $_.ParentProcessId -eq $ParentId }) {
+      Add-ChildProcessIds -ParentId ([int]$child.ProcessId)
+      $idsToStop.Add([int]$child.ProcessId)
+    }
+  }
+
+  Add-ChildProcessIds -ParentId $ProcessId
+  $idsToStop.Add($ProcessId)
+
+  foreach ($id in ($idsToStop | Select-Object -Unique)) {
+    try {
+      Stop-Process -Id $id -Force -ErrorAction Stop
+      Write-Step "$Name stopped process PID $id."
+    } catch {
+      Write-Step "$Name process PID $id was already stopped or could not be stopped."
+    }
+  }
+}
+
+function Stop-ProcessOnPort {
+  param(
+    [string]$Name,
+    [int]$Port
+  )
+
+  $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+  if ($connections.Count -eq 0) {
+    Write-Step "$Name port $Port is clear."
+    return
+  }
+
+  foreach ($connection in $connections) {
+    $ownerPid = [int]$connection.OwningProcess
+    if ($ownerPid -le 0) {
+      continue
+    }
+    Stop-ProcessTree -ProcessId $ownerPid -Name "$Name port $Port owner"
+  }
+}
+
+function Stop-OrphanedProjectProcesses {
+  $escapedRoot = [regex]::Escape($root)
+  $patterns = @(
+    "$escapedRoot.*end_part.*spring-boot:run",
+    "$escapedRoot.*end_part.*EndPartApplication",
+    "$escapedRoot.*frontend.*vite",
+    "$escapedRoot.*video_stream.*yolo_inference_windows.py"
+  )
+
+  $currentPid = $PID
+  $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $commandLine = [string]$_.CommandLine
+    $_.ProcessId -ne $currentPid -and ($patterns | Where-Object { $commandLine -match $_ })
+  })
+
+  if ($processes.Count -eq 0) {
+    Write-Step 'No orphaned project processes found by command line.'
+    return
+  }
+
+  foreach ($process in $processes) {
+    Stop-ProcessTree -ProcessId ([int]$process.ProcessId) -Name 'orphaned project process'
   }
 }
 
@@ -94,6 +170,12 @@ Write-Step 'Stopping frontend and backend processes...'
 Stop-ManagedProcess -Name 'frontend' -PidFileName 'frontend.pid'
 Stop-ManagedProcess -Name 'backend' -PidFileName 'backend.pid'
 Stop-ManagedProcess -Name 'detector-supervisor' -PidFileName 'detector-supervisor.pid'
+
+Write-Step 'Checking ports for orphaned project processes...'
+Stop-ProcessOnPort -Name 'Backend' -Port $backendPort
+Stop-ProcessOnPort -Name 'Frontend' -Port $frontendPort
+Stop-ProcessOnPort -Name 'Detector supervisor' -Port $detectorPort
+Stop-OrphanedProjectProcesses
 
 if ($IncludeNginx) {
   $service = Get-Service -Name $nginxServiceName -ErrorAction SilentlyContinue
